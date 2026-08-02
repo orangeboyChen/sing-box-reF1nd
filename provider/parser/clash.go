@@ -85,6 +85,9 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 	case "tailscale":
 		c.SingType = C.TypeTailscale
 		options = &ClashTailscaleOption{}
+	case "ninja":
+		c.SingType = C.TypeNinja
+		options = &NinjaOption{}
 	default:
 		return nil
 	}
@@ -94,6 +97,24 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 	}
 	c.Options = options
 	return nil
+}
+
+type NinjaOption struct {
+	DialerOptions `yaml:",inline"`
+	ServerOptions `yaml:",inline"`
+	Method        string `yaml:"method"`
+	Password      string `yaml:"password"`
+	NodePassword  string `yaml:"node_password"`
+}
+
+func (n *NinjaOption) Build() any {
+	return &option.NinjaOutboundOptions{
+		DialerOptions: n.DialerOptions.Build(),
+		ServerOptions: n.ServerOptions.Build(),
+		Method:        n.Method,
+		Password:      n.Password,
+		NodePassword:  n.NodePassword,
+	}
 }
 
 func (c *ClashProxy) Build() option.Outbound {
