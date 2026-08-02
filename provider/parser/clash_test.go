@@ -52,3 +52,32 @@ proxies:
 	require.True(t, ok)
 	require.True(t, anyTLSOptions.DisableReuse)
 }
+
+func TestParseClashNinja(t *testing.T) {
+	outbounds, endpoints, err := ParseClashSubscription(context.Background(), `
+proxies:
+  - name: ninja-out
+    type: ninja
+    server: encoded.example
+    port: 12345
+    method: aes-128-gcm
+    password: password
+    node_password: node-password
+proxy-groups:
+  - name: ignored
+    type: select
+rules:
+  - MATCH,DIRECT
+`)
+	require.NoError(t, err)
+	require.Empty(t, endpoints)
+	require.Len(t, outbounds, 1)
+
+	ninjaOptions, ok := outbounds[0].Options.(*option.NinjaOutboundOptions)
+	require.True(t, ok)
+	require.Equal(t, "encoded.example", ninjaOptions.Server)
+	require.Equal(t, uint16(12345), ninjaOptions.ServerPort)
+	require.Equal(t, "aes-128-gcm", ninjaOptions.Method)
+	require.Equal(t, "password", ninjaOptions.Password)
+	require.Equal(t, "node-password", ninjaOptions.NodePassword)
+}
