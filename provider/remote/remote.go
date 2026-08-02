@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -122,12 +123,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	if options.UserAgent != "" && options.HTTPClient != nil && !options.HTTPClient.IsEmpty() {
 		return nil, E.New("user_agent conflicts with http_client: configure User-Agent via http_client.headers instead")
 	}
-	var userAgent string
-	if options.UserAgent == "" {
-		userAgent = "sing-box " + C.Version
-	} else {
-		userAgent = options.UserAgent
-	}
+	userAgent := providerUserAgent(options.URL, options.UserAgent)
 	ctx, cancel := context.WithCancel(ctx)
 	outbound := service.FromContext[adapter.OutboundManager](ctx)
 	endpointMgr := service.FromContext[adapter.EndpointManager](ctx)
@@ -158,6 +154,17 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		//nolint:staticcheck
 		downloadDetour: options.DownloadDetour,
 	}, nil
+}
+
+func providerUserAgent(providerURL string, configuredUserAgent string) string {
+	parsedURL, err := url.Parse(providerURL)
+	if err == nil && strings.EqualFold(parsedURL.Query().Get("tag"), "ninja") {
+		return "clash-ninja/openwrt"
+	}
+	if configuredUserAgent != "" {
+		return configuredUserAgent
+	}
+	return "sing-box " + C.Version
 }
 
 func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
