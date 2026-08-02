@@ -86,6 +86,10 @@ func checkOptions(options *Options) error {
 	if err != nil {
 		return err
 	}
+	err = checkProviders(options.Providers)
+	if err != nil {
+		return err
+	}
 	err = checkCertificateProviders(options.CertificateProviders)
 	if err != nil {
 		return err
@@ -93,6 +97,20 @@ func checkOptions(options *Options) error {
 	err = checkHTTPClients(options.HTTPClients)
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+func checkProviders(providers []Provider) error {
+	seen := make(map[string]bool)
+	for _, provider := range providers {
+		if provider.Tag == "" {
+			return E.New("missing provider tag")
+		}
+		if seen[provider.Tag] {
+			return E.New("duplicate provider tag: ", provider.Tag)
+		}
+		seen[provider.Tag] = true
 	}
 	return nil
 }
