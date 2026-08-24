@@ -27,6 +27,7 @@ var (
 	bucketRuleSet          = []byte("rule_set")
 	bucketExternalUI       = []byte("external_ui")
 	bucketOutboundProvider = []byte("outbound_provider")
+	bucketStorage          = []byte("storage")
 
 	bucketNameList = []string{
 		string(bucketSelected),
@@ -35,6 +36,7 @@ var (
 		string(bucketRuleSet),
 		string(bucketExternalUI),
 		string(bucketOutboundProvider),
+		string(bucketStorage),
 		string(bucketRDRC),
 		string(bucketDNSCache),
 	}

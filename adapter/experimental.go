@@ -60,6 +60,9 @@ type CacheFile interface {
 	SaveExternalUI(tag string, info *SavedBinary) error
 	LoadSubscription(tag string) *SavedBinary
 	SaveSubscription(tag string, sub *SavedBinary) error
+	LoadStorage(key string) []byte
+	SaveStorage(key string, data []byte) error
+	DeleteStorage(key string) error
 }
 
 type SavedBinary struct {
