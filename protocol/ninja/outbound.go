@@ -12,10 +12,12 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
@@ -28,6 +30,7 @@ type Outbound struct {
 	dialer      N.Dialer
 	serverAddr  M.Socksaddr
 	credentials Credentials
+	uotClient   *uot.Client
 }
 
 func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NinjaOutboundOptions) (adapter.Outbound, error) {
@@ -50,16 +53,34 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 	if err != nil {
 		return nil, err
 	}
-	return &Outbound{
-		Adapter:     outbound.NewAdapterWithDialerOptions(C.TypeNinja, tag, []string{N.NetworkTCP}, options.DialerOptions),
+	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
+	networks := []string{N.NetworkTCP}
+	var uotClient *uot.Client
+	if options.UDP {
+		networks = append(networks, N.NetworkUDP)
+		uotClient = &uot.Client{Version: uotOptions.Version}
+	}
+	h := &Outbound{
+		Adapter:     outbound.NewAdapterWithDialerOptions(C.TypeNinja, tag, networks, options.DialerOptions),
 		logger:      logger,
 		dialer:      outboundDialer,
 		serverAddr:  options.ServerOptions.Build(),
 		credentials: Credentials{Method: method, Password: options.Password, NodePassword: options.NodePassword},
-	}, nil
+	}
+	if uotClient != nil {
+		uotClient.Dialer = h
+		h.uotClient = uotClient
+	}
+	return h, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) == N.NetworkUDP {
+		if h.uotClient == nil {
+			return nil, exceptions.New("Ninja UDP over TCP is not enabled")
+		}
+		return h.uotClient.DialContext(ctx, network, destination)
+	}
 	if N.NetworkName(network) != N.NetworkTCP {
 		return nil, exceptions.Extend(N.ErrUnknownNetwork, network)
 	}
@@ -73,8 +94,11 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	return &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), handshakeDone: make(chan struct{})}, nil
 }
 
-func (h *Outbound) ListenPacket(_ context.Context, _ M.Socksaddr) (net.PacketConn, error) {
-	return nil, exceptions.New("Ninja does not support UDP")
+func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if h.uotClient == nil {
+		return nil, exceptions.New("Ninja UDP over TCP is not enabled")
+	}
+	return h.uotClient.ListenPacket(ctx, destination)
 }
 
 type conn struct {

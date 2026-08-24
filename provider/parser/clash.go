@@ -100,11 +100,14 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type NinjaOption struct {
-	DialerOptions `yaml:",inline"`
-	ServerOptions `yaml:",inline"`
-	Method        string `yaml:"method"`
-	Password      string `yaml:"password"`
-	NodePassword  string `yaml:"node_password"`
+	DialerOptions     `yaml:",inline"`
+	ServerOptions     `yaml:",inline"`
+	Method            string `yaml:"method"`
+	Password          string `yaml:"password"`
+	NodePassword      string `yaml:"node_password"`
+	UDP               bool   `yaml:"udp,omitempty"`
+	UDPOverTCP        bool   `yaml:"udp-over-tcp,omitempty"`
+	UDPOverTCPVersion int    `yaml:"udp-over-tcp-version,omitempty"`
 }
 
 func (n *NinjaOption) Build() any {
@@ -114,6 +117,11 @@ func (n *NinjaOption) Build() any {
 		Method:        n.Method,
 		Password:      n.Password,
 		NodePassword:  n.NodePassword,
+		UDP:           n.UDP,
+		UDPOverTCP: &option.UDPOverTCPOptions{
+			Enabled: n.UDPOverTCP,
+			Version: uint8(n.UDPOverTCPVersion),
+		},
 	}
 }
 

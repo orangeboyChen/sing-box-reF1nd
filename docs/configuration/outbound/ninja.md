@@ -12,7 +12,8 @@
 }
 ```
 
-Ninja is a TCP-only outbound. `method` supports `aes-128-gcm`, `aes-192-gcm`,
+Ninja uses an encrypted TCP stream. UDP can be carried over that stream with
+UDP-over-TCP v2 when `udp` and `udp-over-tcp` are enabled. `method` supports `aes-128-gcm`, `aes-192-gcm`,
 `aes-256-gcm`, and `chacha20-ietf-poly1305`.
 
 Ninja subscription node envelopes are decoded when the outbound is created.

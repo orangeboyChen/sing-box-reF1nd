@@ -1,6 +1,6 @@
 # Ninja
 
-Ninja 是仅支持 TCP 的出站协议，支持 `aes-128-gcm`、`aes-192-gcm`、
+Ninja 使用加密 TCP 流；启用 `udp` 和 `udp-over-tcp` 后，可以通过该 TCP 流承载 UDP（UDP-over-TCP v2）。支持 `aes-128-gcm`、`aes-192-gcm`、
 `aes-256-gcm` 与 `chacha20-ietf-poly1305`。
 
 通过顶层 `providers` 引入 Ninja 订阅 YAML 时，仅导入其 `proxies` 中
