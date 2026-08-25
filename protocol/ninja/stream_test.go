@@ -3,7 +3,20 @@ package ninja
 import (
 	"bytes"
 	"testing"
+
+	"github.com/sagernet/sing/common/uot"
 )
+
+func TestUoTMagicDestinationAllowsZeroPort(t *testing.T) {
+	for _, host := range []string{uot.MagicAddress, uot.LegacyMagicAddress} {
+		if _, err := encodeTransportDestination(Destination{Host: host}); err != nil {
+			t.Fatalf("encode %q: %v", host, err)
+		}
+	}
+	if _, err := encodeTransportDestination(Destination{Host: "example.test"}); err == nil {
+		t.Fatal("regular destination without port was accepted")
+	}
+}
 
 func TestHandshakeAndFramesRoundTrip(t *testing.T) {
 	credentials := Credentials{Method: AES128GCM, Password: "test-password", NodePassword: "test-node-password"}

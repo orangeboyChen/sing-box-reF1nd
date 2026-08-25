@@ -10,6 +10,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/sagernet/sing/common/uot"
 	"lukechampine.com/blake3"
 )
 
@@ -398,7 +399,7 @@ func equal(left, right []byte) bool {
 	return value == 0
 }
 func encodeTransportDestination(destination Destination) ([]byte, error) {
-	if destination.Host == "" || destination.Port == 0 {
+	if destination.Host == "" || (destination.Port == 0 && destination.Host != uot.MagicAddress && destination.Host != uot.LegacyMagicAddress) {
 		return nil, fmt.Errorf("Ninja destination host and port are required")
 	}
 	if address := net.ParseIP(destination.Host); address != nil {
