@@ -12,10 +12,6 @@ on:
         required: true
         default: false
         type: boolean
-  push:
-    branches:
-      - reF1nd-testing
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -42,11 +38,7 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            version="$INPUT_VERSION"
-          else
-            version="$(go run ./cmd/internal/read_tag --nightly)"
-          fi
+          version="$INPUT_VERSION"
           version="${version#v}"
           if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
             echo "Invalid version: $version" >&2
