@@ -14,7 +14,7 @@ func TestRejectsDestinationWithoutPort(t *testing.T) {
 func TestUDPHandshakeUsesNativeNetwork(t *testing.T) {
 	credentials := Credentials{Method: AES128GCM, Password: "test-password", NodePassword: "test-node-password"}
 	var wire bytes.Buffer
-	if _, err := credentials.WriteClientHandshakeNetwork(&wire, udpNetwork, Destination{Host: "1.1.1.1", Port: 53}, []byte("payload"), 0); err != nil {
+	if _, err := credentials.WriteClientHandshakeNetwork(&wire, udpNetwork, Destination{Host: "1.1.1.1", Port: 53}, []byte("payload"), 1); err != nil {
 		t.Fatal(err)
 	}
 	_, header, destination, payload, err := credentials.ReadClientHandshake(&wire)

@@ -149,7 +149,11 @@ func (c *conn) startLocked(payload []byte) error {
 		return nil
 	}
 	capture := &saltCaptureWriter{Writer: c.Conn}
-	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload, 0)
+	paddingLength := 0
+	if c.network == udpNetwork {
+		paddingLength = 1
+	}
+	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload, paddingLength)
 	c.handshakeOnce.Do(func() {
 		c.handshakeErr = err
 		if err == nil {
