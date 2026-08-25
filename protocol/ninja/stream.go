@@ -10,7 +10,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/sagernet/sing/common/uot"
 	"lukechampine.com/blake3"
 )
 
@@ -18,6 +17,7 @@ const (
 	headerSize        = 12
 	authenticatorSize = aes.BlockSize
 	tcpNetwork        = 1
+	udpNetwork        = 2
 )
 
 type Credentials struct {
@@ -58,6 +58,10 @@ func (credentials Credentials) validate() error {
 }
 
 func (credentials Credentials) WriteClientHandshake(writer io.Writer, destination Destination, payload []byte, paddingLength int) (*Session, error) {
+	return credentials.WriteClientHandshakeNetwork(writer, tcpNetwork, destination, payload, paddingLength)
+}
+
+func (credentials Credentials) WriteClientHandshakeNetwork(writer io.Writer, network byte, destination Destination, payload []byte, paddingLength int) (*Session, error) {
 	if err := credentials.validate(); err != nil {
 		return nil, err
 	}
@@ -91,7 +95,7 @@ func (credentials Credentials) WriteClientHandshake(writer io.Writer, destinatio
 	if err != nil {
 		return nil, err
 	}
-	headerCiphertext := session.seal(makeHeader(tcpNetwork, uint16(len(firstData))))
+	headerCiphertext := session.seal(makeHeader(network, uint16(len(firstData))))
 	firstDataCiphertext := session.seal(firstData)
 	if err := writeAll(writer, salt, authenticator, headerCiphertext, firstDataCiphertext); err != nil {
 		return nil, err
@@ -399,7 +403,7 @@ func equal(left, right []byte) bool {
 	return value == 0
 }
 func encodeTransportDestination(destination Destination) ([]byte, error) {
-	if destination.Host == "" || (destination.Port == 0 && destination.Host != uot.MagicAddress && destination.Host != uot.LegacyMagicAddress) {
+	if destination.Host == "" || destination.Port == 0 {
 		return nil, fmt.Errorf("Ninja destination host and port are required")
 	}
 	if address := net.ParseIP(destination.Host); address != nil {

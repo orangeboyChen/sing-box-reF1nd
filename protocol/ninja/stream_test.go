@@ -3,18 +3,26 @@ package ninja
 import (
 	"bytes"
 	"testing"
-
-	"github.com/sagernet/sing/common/uot"
 )
 
-func TestUoTMagicDestinationAllowsZeroPort(t *testing.T) {
-	for _, host := range []string{uot.MagicAddress, uot.LegacyMagicAddress} {
-		if _, err := encodeTransportDestination(Destination{Host: host}); err != nil {
-			t.Fatalf("encode %q: %v", host, err)
-		}
-	}
+func TestRejectsDestinationWithoutPort(t *testing.T) {
 	if _, err := encodeTransportDestination(Destination{Host: "example.test"}); err == nil {
 		t.Fatal("regular destination without port was accepted")
+	}
+}
+
+func TestUDPHandshakeUsesNativeNetwork(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "test-password", NodePassword: "test-node-password"}
+	var wire bytes.Buffer
+	if _, err := credentials.WriteClientHandshakeNetwork(&wire, udpNetwork, Destination{Host: "1.1.1.1", Port: 53}, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	_, header, destination, payload, err := credentials.ReadClientHandshake(&wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.Network != udpNetwork || destination != (Destination{Host: "1.1.1.1", Port: 53}) || !bytes.Equal(payload, []byte("payload")) {
+		t.Fatalf("unexpected UDP handshake: network=%d destination=%v payload=%q", header.Network, destination, payload)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -17,7 +18,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/uot"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
@@ -30,7 +30,6 @@ type Outbound struct {
 	dialer      N.Dialer
 	serverAddr  M.Socksaddr
 	credentials Credentials
-	uotClient   *uot.Client
 }
 
 func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NinjaOutboundOptions) (adapter.Outbound, error) {
@@ -53,12 +52,9 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 	if err != nil {
 		return nil, err
 	}
-	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
 	networks := []string{N.NetworkTCP}
-	var uotClient *uot.Client
 	if options.UDP {
 		networks = append(networks, N.NetworkUDP)
-		uotClient = &uot.Client{Version: uotOptions.Version}
 	}
 	h := &Outbound{
 		Adapter:     outbound.NewAdapterWithDialerOptions(C.TypeNinja, tag, networks, options.DialerOptions),
@@ -67,19 +63,19 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		serverAddr:  options.ServerOptions.Build(),
 		credentials: Credentials{Method: method, Password: options.Password, NodePassword: options.NodePassword},
 	}
-	if uotClient != nil {
-		uotClient.Dialer = h
-		h.uotClient = uotClient
-	}
 	return h, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if N.NetworkName(network) == N.NetworkUDP {
-		if h.uotClient == nil {
-			return nil, exceptions.New("Ninja UDP over TCP is not enabled")
+		if !common.Contains(h.Network(), N.NetworkUDP) {
+			return nil, exceptions.New("Ninja UDP is not enabled")
 		}
-		return h.uotClient.DialContext(ctx, network, destination)
+		connection, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+		if err != nil {
+			return nil, err
+		}
+		return &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), network: udpNetwork, handshakeDone: make(chan struct{})}, nil
 	}
 	if N.NetworkName(network) != N.NetworkTCP {
 		return nil, exceptions.Extend(N.ErrUnknownNetwork, network)
@@ -91,20 +87,25 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	if err != nil {
 		return nil, err
 	}
-	return &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), handshakeDone: make(chan struct{})}, nil
+	return &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), network: tcpNetwork, handshakeDone: make(chan struct{})}, nil
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	if h.uotClient == nil {
-		return nil, exceptions.New("Ninja UDP over TCP is not enabled")
+	if !common.Contains(h.Network(), N.NetworkUDP) {
+		return nil, exceptions.New("Ninja UDP is not enabled")
 	}
-	return h.uotClient.ListenPacket(ctx, destination)
+	connection, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &packetConn{conn: &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), network: udpNetwork, handshakeDone: make(chan struct{})}, destination: destination}, nil
 }
 
 type conn struct {
 	net.Conn
 	credentials   Credentials
 	destination   Destination
+	network       byte
 	clientSalt    []byte
 	readSession   *Session
 	writeSession  *Session
@@ -115,12 +116,40 @@ type conn struct {
 	handshakeErr  error
 }
 
+type packetConn struct {
+	conn        *conn
+	destination M.Socksaddr
+}
+
+func (c *packetConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
+	count, err := c.conn.Read(buffer)
+	return count, c.destination, err
+}
+
+func (c *packetConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
+	return c.conn.Write(buffer)
+}
+
+func (c *packetConn) Close() error { return c.conn.Close() }
+
+func (c *packetConn) LocalAddr() net.Addr { return c.conn.LocalAddr() }
+
+func (c *packetConn) SetDeadline(deadline time.Time) error { return c.conn.SetDeadline(deadline) }
+
+func (c *packetConn) SetReadDeadline(deadline time.Time) error {
+	return c.conn.SetReadDeadline(deadline)
+}
+
+func (c *packetConn) SetWriteDeadline(deadline time.Time) error {
+	return c.conn.SetWriteDeadline(deadline)
+}
+
 func (c *conn) startLocked(payload []byte) error {
 	if c.writeSession != nil {
 		return nil
 	}
 	capture := &saltCaptureWriter{Writer: c.Conn}
-	writeSession, err := c.credentials.WriteClientHandshake(capture, c.destination, payload, 0)
+	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload, 0)
 	c.handshakeOnce.Do(func() {
 		c.handshakeErr = err
 		if err == nil {
