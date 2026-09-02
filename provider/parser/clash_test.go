@@ -82,3 +82,23 @@ rules:
 	require.Equal(t, "password", ninjaOptions.Password)
 	require.Equal(t, "node-password", ninjaOptions.NodePassword)
 }
+
+func TestParseClashNinjaV2PassInfo(t *testing.T) {
+	outbounds, endpoints, err := ParseClashSubscription(context.Background(), `#!PASS-INFO encoded-pass
+proxies:
+  - name: ninja-v2-out
+    type: ninja
+    server: encoded.example
+    port: 12345
+    method: aes-128-gcm
+    password: password
+    node_password: node-password
+`)
+	require.NoError(t, err)
+	require.Empty(t, endpoints)
+	require.Len(t, outbounds, 1)
+	require.Equal(t, "ninjav2", outbounds[0].Type)
+	ninjaOptions := outbounds[0].Options.(*option.NinjaV2OutboundOptions)
+	require.Equal(t, "encoded-pass", ninjaOptions.PassInfo)
+	require.Equal(t, 1, ninjaOptions.PassVersion)
+}

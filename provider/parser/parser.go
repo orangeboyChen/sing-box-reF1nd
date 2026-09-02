@@ -116,6 +116,11 @@ func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *optio
 			options := outbound.Options.(*option.NinjaOutboundOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			outbound.Options = options
+		case C.TypeNinjaV2:
+			options := outbound.Options.(*option.NinjaV2OutboundOptions)
+			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
+			options.OutboundTLSOptionsContainer.TLS = overrideTLSOption(options.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
+			outbound.Options = options
 		}
 		parsedOutbounds = append(parsedOutbounds, outbound)
 	}

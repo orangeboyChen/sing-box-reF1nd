@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -22,6 +23,8 @@ import (
 type ClashConfig struct {
 	Proxies []ClashProxy `yaml:"proxies"`
 }
+
+var ninjaPassInfoPattern = regexp.MustCompile(`(?m)^#!PASS(?P<version>[23]?)-INFO[ \t]+([^\r\n]+)`)
 
 type _ClashProxy struct {
 	Name    string `yaml:"name"`
@@ -88,6 +91,9 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 	case "ninja":
 		c.SingType = C.TypeNinja
 		options = &NinjaOption{}
+	case "ninjav2":
+		c.SingType = C.TypeNinjaV2
+		options = &NinjaOption{}
 	default:
 		return nil
 	}
@@ -96,21 +102,42 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 	c.Options = options
+	if ninjaOptions, ok := options.(*NinjaOption); ok {
+		ninjaOptions.Protocol = c.SingType
+	}
 	return nil
 }
 
 type NinjaOption struct {
 	DialerOptions     `yaml:",inline"`
 	ServerOptions     `yaml:",inline"`
+	TLSOptions        `yaml:",inline"`
 	Method            string `yaml:"method"`
 	Password          string `yaml:"password"`
 	NodePassword      string `yaml:"node_password"`
 	UDP               bool   `yaml:"udp,omitempty"`
 	UDPOverTCP        bool   `yaml:"udp-over-tcp,omitempty"`
 	UDPOverTCPVersion int    `yaml:"udp-over-tcp-version,omitempty"`
+	PassInfo          string `yaml:"pass-info,omitempty"`
+	PassVersion       int    `yaml:"passversion,omitempty"`
+	Protocol          string `yaml:"-"`
 }
 
 func (n *NinjaOption) Build() any {
+	if n.Protocol == C.TypeNinjaV2 {
+		return &option.NinjaV2OutboundOptions{
+			DialerOptions:               n.DialerOptions.Build(),
+			ServerOptions:               n.ServerOptions.Build(),
+			OutboundTLSOptionsContainer: clashTLSOptions(n.Server, &n.TLSOptions),
+			Method:                      n.Method,
+			Password:                    n.Password,
+			NodePassword:                n.NodePassword,
+			UDP:                         n.UDP,
+			UDPOverTCP:                  &option.UDPOverTCPOptions{Enabled: n.UDPOverTCP, Version: uint8(n.UDPOverTCPVersion)},
+			PassInfo:                    n.PassInfo,
+			PassVersion:                 n.PassVersion,
+		}
+	}
 	return &option.NinjaOutboundOptions{
 		DialerOptions: n.DialerOptions.Build(),
 		ServerOptions: n.ServerOptions.Build(),
@@ -153,6 +180,22 @@ func ParseClashSubscription(_ context.Context, content string) ([]option.Outboun
 	if err != nil {
 		return nil, nil, E.Cause(err, "parse clash config")
 	}
+	passInfo, passVersion := parseNinjaPassInfo(content)
+	if passInfo != "" {
+		for index := range config.Proxies {
+			proxy := &config.Proxies[index]
+			if proxy.SingType == C.TypeNinja {
+				proxy.SingType = C.TypeNinjaV2
+			}
+			if options, ok := proxy.Options.(*NinjaOption); ok {
+				options.PassInfo = passInfo
+				options.PassVersion = passVersion
+				if proxy.SingType == C.TypeNinjaV2 {
+					options.Protocol = C.TypeNinjaV2
+				}
+			}
+		}
+	}
 	outbounds := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Outbound, bool) {
 		if proxy.SingType == "" || proxy.SingType == C.TypeWireGuard || proxy.SingType == C.TypeTailscale {
 			return option.Outbound{}, false
@@ -172,6 +215,20 @@ func ParseClashSubscription(_ context.Context, content string) ([]option.Outboun
 		return proxy.BuildEndpoint(), true
 	})
 	return outbounds, endpoints, nil
+}
+
+func parseNinjaPassInfo(content string) (string, int) {
+	match := ninjaPassInfoPattern.FindStringSubmatch(content)
+	if len(match) != 3 {
+		return "", 0
+	}
+	version := 1
+	if match[1] == "2" {
+		version = 2
+	} else if match[1] == "3" {
+		version = 3
+	}
+	return match[2], version
 }
 
 type ShadowSocksOption struct {
