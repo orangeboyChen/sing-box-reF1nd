@@ -696,6 +696,9 @@
         "external_ui_update_interval": {
           "$ref": "#/$defs/Duration"
         },
+        "core_upgrade_script": {
+          "type": "string"
+        },
         "secret": {
           "type": "string"
         },

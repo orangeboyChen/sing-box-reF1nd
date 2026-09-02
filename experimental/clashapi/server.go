@@ -68,6 +68,7 @@ type Server struct {
 	externalUIHTTPClient     *option.HTTPClientOptions
 	externalUIDownloadDetour string
 	externalUIUpdateInterval time.Duration
+	coreUpgradeScript        string
 	cacheFile                adapter.CacheFile
 	lastEtag                 string
 	lastUpdated              time.Time
@@ -110,6 +111,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
 		externalUIHTTPClient:     options.ExternalUIHTTPClient,
 		externalUIUpdateInterval: updateInterval,
+		coreUpgradeScript:        os.ExpandEnv(options.CoreUpgradeScript),
 		cacheFile:                service.FromContext[adapter.CacheFile](ctx),
 
 		//nolint:staticcheck

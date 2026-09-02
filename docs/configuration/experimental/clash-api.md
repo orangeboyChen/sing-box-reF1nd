@@ -26,6 +26,7 @@
       "external_ui": "",
       "external_ui_download_url": "",
       "external_ui_http_client": "", // or {}
+      "core_upgrade_script": "",
       "secret": "",
       "default_mode": "",
       "access_control_allow_origin": [],
@@ -96,6 +97,14 @@ serve it at `http://{{external-controller}}/ui`.
 ZIP download URL for the external UI, will be used if the specified `external_ui` directory is empty.
 
 `https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip` will be used if empty.
+
+#### core_upgrade_script
+
+Path to an executable script that handles core upgrades requested through the
+Clash API. The script receives `update_core` and a channel argument (`auto`,
+`release`, or `alpha`). This can be set to ShellCrash's `core_upgrade.sh`.
+The `/upgrade` endpoint returns `501` when no script is configured.
+The script must have permission to replace the core files.
 
 #### external_ui_http_client
 
