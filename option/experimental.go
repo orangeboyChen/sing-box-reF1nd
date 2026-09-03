@@ -35,6 +35,7 @@ type ClashAPIOptions struct {
 	ExternalUIDownloadURL            string                     `json:"external_ui_download_url,omitempty"`
 	ExternalUIHTTPClient             *HTTPClientOptions         `json:"external_ui_http_client,omitempty"`
 	ExternalUIUpdateInterval         badoption.Duration         `json:"external_ui_update_interval,omitempty"`
+	CoreUpgradeScript                string                     `json:"core_upgrade_script,omitempty"`
 	Secret                           string                     `json:"secret,omitempty"`
 	DefaultMode                      string                     `json:"default_mode,omitempty"`
 	ModeList                         []string                   `json:"-"`
