@@ -158,8 +158,10 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 func providerUserAgent(providerURL string, configuredUserAgent string) string {
 	parsedURL, err := url.Parse(providerURL)
-	if err == nil && strings.EqualFold(parsedURL.Query().Get("tag"), "ninja") {
-		return "clash-ninja/openwrt"
+	if err == nil {
+		if strings.EqualFold(parsedURL.Query().Get("tag"), "ninja") || strings.Contains(strings.ToLower(parsedURL.Path), "/ninja/") {
+			return "clash-ninja/v2.4.0"
+		}
 	}
 	if configuredUserAgent != "" {
 		return configuredUserAgent
