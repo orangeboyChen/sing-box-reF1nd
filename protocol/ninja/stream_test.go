@@ -52,7 +52,7 @@ func TestUDPResponseStripsDestination(t *testing.T) {
 	}
 }
 
-func TestUDPStreamResponseStripsDestination(t *testing.T) {
+func TestUDPStreamResponsePreservesPayload(t *testing.T) {
 	connection := &conn{
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
 		handshakeDone: make(chan struct{}),
@@ -66,7 +66,8 @@ func TestUDPStreamResponseStripsDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != len("dns-payload") || !bytes.Equal(buffer[:count], []byte("dns-payload")) {
+	expected := append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...)
+	if count != len(expected) || !bytes.Equal(buffer[:count], expected) {
 		t.Fatalf("unexpected UDP stream payload: %q", buffer[:count])
 	}
 }
