@@ -2,6 +2,7 @@ package ninja
 
 import (
 	"bytes"
+	"net"
 	"testing"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -33,6 +34,7 @@ func TestUDPResponseStripsDestination(t *testing.T) {
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
 		handshakeDone: make(chan struct{}),
 		readSession:   &Session{},
+		writeSession:  &Session{},
 		credentials:   Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"},
 	}
 	close(connection.handshakeDone)
@@ -55,6 +57,7 @@ func TestUDPStreamResponseStripsDestination(t *testing.T) {
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
 		handshakeDone: make(chan struct{}),
 		readSession:   &Session{},
+		writeSession:  &Session{},
 		network:       udpNetwork,
 	}
 	close(connection.handshakeDone)
@@ -92,6 +95,77 @@ func TestHandshakeAndFramesRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(frame, []byte("later frame")) {
 		t.Fatal("frame mismatch")
+	}
+}
+
+func TestReadStartsHandshake(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	client := NewClientConn(clientRaw, credentials, Destination{Host: "example.test", Port: 443})
+	serverDone := make(chan error, 1)
+	go func() {
+		_, header, _, _, err := credentials.ReadClientHandshake(serverRaw)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		_, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: []byte("greeting")})
+		serverDone <- err
+	}()
+	buffer := make([]byte, 32)
+	count, err := client.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer[:count], []byte("greeting")) {
+		t.Fatalf("unexpected greeting: %q", buffer[:count])
+	}
+	if err = <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLargeTCPWriteSplitsNinjaFrames(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	client := NewClientConn(clientRaw, credentials, Destination{Host: "example.test", Port: 443})
+	payload := bytes.Repeat([]byte("x"), 0xffff+1024)
+	writeResult := make(chan struct {
+		count int
+		err   error
+	}, 1)
+	go func() {
+		count, err := client.Write(payload)
+		writeResult <- struct {
+			count int
+			err   error
+		}{count, err}
+	}()
+	reader, _, _, initial, err := credentials.ReadClientHandshake(serverRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) != 0 {
+		t.Fatalf("unexpected initial payload length: %d", len(initial))
+	}
+	received := make([]byte, 0, len(payload))
+	for len(received) < len(payload) {
+		frame, readErr := reader.ReadFrame(serverRaw)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		received = append(received, frame...)
+	}
+	result := <-writeResult
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if result.count != len(payload) || !bytes.Equal(received, payload) {
+		t.Fatalf("large write mismatch: count=%d payload=%d received=%d", result.count, len(payload), len(received))
 	}
 }
 

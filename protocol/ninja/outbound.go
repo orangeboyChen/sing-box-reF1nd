@@ -190,6 +190,14 @@ func (c *conn) startLocked(payload []byte) error {
 }
 
 func (c *conn) ensureReadSession() error {
+	c.writeAccess.Lock()
+	if c.writeSession == nil {
+		if err := c.startLocked(nil); err != nil {
+			c.writeAccess.Unlock()
+			return err
+		}
+	}
+	c.writeAccess.Unlock()
 	<-c.handshakeDone
 	if c.handshakeErr != nil {
 		return c.handshakeErr
@@ -261,16 +269,60 @@ func decodeUDPResponse(payload []byte) (Destination, []byte, error) {
 func (c *conn) Write(payload []byte) (int, error) {
 	c.writeAccess.Lock()
 	defer c.writeAccess.Unlock()
+	originalLength := len(payload)
 	if c.writeSession == nil {
-		if err := c.startLocked(payload); err != nil {
+		if c.network == udpNetwork {
+			if err := c.startLocked(payload); err != nil {
+				return 0, err
+			}
+			return len(payload), nil
+		}
+		initialLimit, err := c.initialPayloadLimit()
+		if err != nil {
+			return 0, err
+		}
+		if len(payload) <= initialLimit {
+			if err := c.startLocked(payload); err != nil {
+				return 0, err
+			}
+			return len(payload), nil
+		}
+		if err := c.startLocked(nil); err != nil {
+			return 0, err
+		}
+	}
+	if c.network == udpNetwork {
+		if len(payload) > 0xffff {
+			return 0, fmt.Errorf("Ninja UDP datagram is too large: %d", len(payload))
+		}
+		if err := c.writeSession.WriteFrame(c.Conn, payload); err != nil {
 			return 0, err
 		}
 		return len(payload), nil
 	}
-	if err := c.writeSession.WriteFrame(c.Conn, payload); err != nil {
+	for len(payload) > 0 {
+		chunkLength := len(payload)
+		if chunkLength > 0xffff {
+			chunkLength = 0xffff
+		}
+		if err := c.writeSession.WriteFrame(c.Conn, payload[:chunkLength]); err != nil {
+			return 0, err
+		}
+		payload = payload[chunkLength:]
+	}
+	return originalLength, nil
+}
+
+func (c *conn) initialPayloadLimit() (int, error) {
+	destination, err := encodeTransportDestination(c.destination)
+	if err != nil {
 		return 0, err
 	}
-	return len(payload), nil
+	paddingLength := 0
+	if c.network == udpNetwork {
+		paddingLength = 1
+	}
+	return 0xffff - len(destination) - 2 - paddingLength, nil
 }
 
 type saltCaptureWriter struct {
