@@ -143,14 +143,11 @@ func (c *packetConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, c.destination, err
 	}
-	destination, consumed, err := decodeTransportDestination(payload)
+	destination, payload, err := decodeUDPResponse(payload)
 	if err != nil {
 		return 0, c.destination, fmt.Errorf("decode Ninja UDP response address: %w", err)
 	}
-	if len(payload) == consumed {
-		return 0, c.destination, io.ErrUnexpectedEOF
-	}
-	count := copy(buffer, payload[consumed:])
+	count := copy(buffer, payload)
 	return count, M.ParseSocksaddrHostPort(destination.Host, destination.Port), nil
 }
 
@@ -224,7 +221,16 @@ func (c *conn) Read(buffer []byte) (int, error) {
 		}
 		c.buffer = payload
 	}
-	size := copy(buffer, c.buffer)
+	payload := c.buffer
+	if c.network == udpNetwork {
+		_, payload, err := decodeUDPResponse(payload)
+		if err != nil {
+			return 0, fmt.Errorf("decode Ninja UDP response address: %w", err)
+		}
+		c.buffer = nil
+		return copy(buffer, payload), nil
+	}
+	size := copy(buffer, payload)
 	c.buffer = c.buffer[size:]
 	return size, nil
 }
@@ -239,6 +245,17 @@ func (c *conn) readPacket() ([]byte, error) {
 		return payload, nil
 	}
 	return c.readSession.ReadFrame(c.Conn)
+}
+
+func decodeUDPResponse(payload []byte) (Destination, []byte, error) {
+	destination, consumed, err := decodeTransportDestination(payload)
+	if err != nil {
+		return Destination{}, nil, err
+	}
+	if len(payload) == consumed {
+		return Destination{}, nil, io.ErrUnexpectedEOF
+	}
+	return destination, payload[consumed:], nil
 }
 
 func (c *conn) Write(payload []byte) (int, error) {

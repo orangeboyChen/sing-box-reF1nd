@@ -50,6 +50,24 @@ func TestUDPResponseStripsDestination(t *testing.T) {
 	}
 }
 
+func TestUDPStreamResponseStripsDestination(t *testing.T) {
+	connection := &conn{
+		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
+		handshakeDone: make(chan struct{}),
+		readSession:   &Session{},
+		network:       udpNetwork,
+	}
+	close(connection.handshakeDone)
+	buffer := make([]byte, 32)
+	count, err := connection.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != len("dns-payload") || !bytes.Equal(buffer[:count], []byte("dns-payload")) {
+		t.Fatalf("unexpected UDP stream payload: %q", buffer[:count])
+	}
+}
+
 func TestHandshakeAndFramesRoundTrip(t *testing.T) {
 	credentials := Credentials{Method: AES128GCM, Password: "test-password", NodePassword: "test-node-password"}
 	destination := Destination{Host: "example.test", Port: 443}
