@@ -197,7 +197,7 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
 		err = s.fetch(ctx, true)
 		if err != nil {
-			return E.Cause(err, "initial outbound provider: ", s.Tag())
+			s.logger.Error(E.Cause(err, "initial outbound provider: ", s.Tag(), ", will retry in ", s.updateInterval))
 		}
 	}
 	s.ticker = time.NewTicker(s.updateInterval)
