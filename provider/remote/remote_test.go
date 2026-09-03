@@ -81,18 +81,28 @@ func TestProviderUserAgent(t *testing.T) {
 		{
 			name:        "ninja tag",
 			providerURL: "https://example.com/subscription?tag=ninja",
-			expected:    "clash-ninja/openwrt",
+			expected:    "clash-ninja/v2.4.0",
 		},
 		{
 			name:        "case insensitive ninja tag",
 			providerURL: "https://example.com/subscription?tag=NINJA",
-			expected:    "clash-ninja/openwrt",
+			expected:    "clash-ninja/v2.4.0",
 		},
 		{
 			name:                "ninja tag takes priority over configured user agent",
 			providerURL:         "https://example.com/subscription?tag=ninja",
 			configuredUserAgent: "custom-agent",
-			expected:            "clash-ninja/openwrt",
+			expected:            "clash-ninja/v2.4.0",
+		},
+		{
+			name:        "ninja path",
+			providerURL: "https://example.com/222/ninja/token",
+			expected:    "clash-ninja/v2.4.0",
+		},
+		{
+			name:        "case insensitive ninja path",
+			providerURL: "https://example.com/222/NINJA/token",
+			expected:    "clash-ninja/v2.4.0",
 		},
 		{
 			name:        "default user agent",
