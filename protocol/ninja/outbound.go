@@ -116,6 +116,11 @@ type conn struct {
 	handshakeErr  error
 }
 
+// NewClientConn wraps an established transport with the Ninja core protocol.
+func NewClientConn(connection net.Conn, credentials Credentials, destination Destination) net.Conn {
+	return &conn{Conn: connection, credentials: credentials, destination: destination, network: tcpNetwork, handshakeDone: make(chan struct{})}
+}
+
 type packetConn struct {
 	conn        *conn
 	destination M.Socksaddr

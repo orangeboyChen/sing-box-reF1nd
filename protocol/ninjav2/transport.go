@@ -22,8 +22,15 @@ func incrementNonce(nonce []byte) {
 }
 func writeAll(writer io.Writer, chunks ...[]byte) error {
 	for _, chunk := range chunks {
-		if _, err := writer.Write(chunk); err != nil {
-			return err
+		for len(chunk) > 0 {
+			written, err := writer.Write(chunk)
+			if err != nil {
+				return err
+			}
+			if written == 0 {
+				return io.ErrShortWrite
+			}
+			chunk = chunk[written:]
 		}
 	}
 	return nil

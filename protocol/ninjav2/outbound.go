@@ -3,7 +3,6 @@ package ninjav2
 import (
 	"context"
 	"net"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -12,11 +11,15 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/ninja"
+	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/exceptions"
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
@@ -26,17 +29,40 @@ func RegisterOutbound(registry *outbound.Registry) {
 type Outbound struct {
 	outbound.Adapter
 	logger       logger.ContextLogger
-	dialer       N.Dialer
-	serverAddr   M.Socksaddr
-	method       Method
-	password     string
+	transport    adapter.V2RayClientTransport
+	passMethod   Method
+	passPassword string
+	coreMethod   ninja.Method
+	corePassword string
+	paddingMode  string
+	paddingMin   int
+	paddingMax   int
 	nodePassword string
-	passInfo     string
-	passVersion  int
+	uotClient    *uot.Client
 }
 
 func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NinjaV2OutboundOptions) (adapter.Outbound, error) {
-	method, err := ParseMethod(options.Method)
+	if options.PassInfo == "" {
+		return nil, E.New("missing NinjaV2 PASS-INFO")
+	}
+	info, err := decodePassInfo(options.PassInfo, options.PassVersion)
+	if err != nil {
+		return nil, E.Cause(err, "decode NinjaV2 PASS-INFO")
+	}
+	if !info.Set.Pass {
+		return nil, E.New("NinjaV2 PASS transport is disabled")
+	}
+	if info.Set.Network != C.V2RayTransportTypeWebsocket {
+		return nil, E.New("unsupported NinjaV2 transport: ", info.Set.Network)
+	}
+	passMethod, err := ParseMethod(info.Set.PassOptions.Method)
+	if err != nil {
+		return nil, err
+	}
+	if info.Set.PassOptions.Password == "" {
+		return nil, E.New("missing NinjaV2 PASS password")
+	}
+	coreMethod, err := ninja.ParseMethod(options.Method)
 	if err != nil {
 		return nil, err
 	}
@@ -45,86 +71,125 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		return nil, err
 	}
 	if decoded.Port < 1 || decoded.Port > 65535 {
-		return nil, exceptions.New("invalid NinjaV2 decoded port")
+		return nil, E.New("invalid NinjaV2 decoded port")
 	}
-	options.Server, options.ServerPort, options.NodePassword = decoded.Server, uint16(decoded.Port), decoded.NodePassword
-	if options.Server == "" || options.ServerPort == 0 || options.Password == "" || options.NodePassword == "" {
-		return nil, exceptions.New("missing NinjaV2 server or credentials")
-	}
-	if options.PassInfo == "" {
-		return nil, exceptions.New("missing NinjaV2 PASS-INFO")
+	options.Server = info.replaceServer(decoded.Server)
+	options.ServerPort = uint16(decoded.Port)
+	if options.Server == "" {
+		return nil, E.New("missing NinjaV2 decoded server")
 	}
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
-	if options.TLS != nil && options.TLS.Enabled {
-		tlsConfig, err := boxTLS.NewClient(ctx, logger, options.Server, *options.TLS)
+	tlsOptions := option.OutboundTLSOptions{Enabled: info.Set.TLS, ServerName: info.Set.ServerName, Insecure: info.Set.SkipCertVerify}
+	var tlsConfig boxTLS.Config
+	if tlsOptions.Enabled {
+		tlsConfig, err = boxTLS.NewClient(ctx, logger, options.Server, tlsOptions)
 		if err != nil {
 			return nil, err
 		}
-		outboundDialer = boxTLS.NewDialer(outboundDialer, tlsConfig)
+	}
+	headers := make(badoption.HTTPHeader, len(info.Set.WebsocketOptions.Headers))
+	for name, value := range info.Set.WebsocketOptions.Headers {
+		headers[name] = badoption.Listable[string]{value}
+	}
+	serverAddr := options.ServerOptions.Build()
+	transport, err := v2ray.NewClientTransport(ctx, outboundDialer, serverAddr, option.V2RayTransportOptions{
+		Type: C.V2RayTransportTypeWebsocket,
+		WebsocketOptions: option.V2RayWebsocketOptions{
+			Path: info.Set.WebsocketOptions.Path, Headers: headers,
+		},
+	}, tlsConfig)
+	if err != nil {
+		return nil, E.Cause(err, "create NinjaV2 WebSocket transport")
 	}
 	networks := []string{N.NetworkTCP}
 	if options.UDP {
 		networks = append(networks, N.NetworkUDP)
 	}
-	return &Outbound{Adapter: outbound.NewAdapterWithDialerOptions(C.TypeNinjaV2, tag, networks, options.DialerOptions), logger: logger, dialer: outboundDialer, serverAddr: options.ServerOptions.Build(), method: method, password: options.Password, nodePassword: options.NodePassword, passInfo: options.PassInfo, passVersion: options.PassVersion}, nil
+	result := &Outbound{
+		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeNinjaV2, tag, networks, options.DialerOptions),
+		logger:  logger, transport: transport, passMethod: passMethod, passPassword: info.Set.PassOptions.Password,
+		coreMethod: coreMethod, corePassword: options.Password,
+		paddingMode: info.Set.PassOptions.PaddingMode, paddingMin: info.Set.PassOptions.PaddingMin,
+		paddingMax:   info.Set.PassOptions.PaddingRandomMax,
+		nodePassword: decoded.NodePassword,
+	}
+	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
+	if uotOptions.Enabled {
+		result.uotClient = &uot.Client{Dialer: (*ninjaV2Dialer)(result), Version: uotOptions.Version}
+	}
+	return result, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	if N.NetworkName(network) == N.NetworkUDP && !common.Contains(h.Network(), N.NetworkUDP) {
-		return nil, exceptions.New("NinjaV2 UDP is not enabled")
-	}
-	if N.NetworkName(network) != N.NetworkTCP && N.NetworkName(network) != N.NetworkUDP {
-		return nil, exceptions.Extend(N.ErrUnknownNetwork, network)
-	}
-	if N.NetworkName(network) == N.NetworkTCP {
-		ctx, metadata := adapter.ExtendContext(ctx)
-		metadata.Outbound, metadata.Destination = h.Tag(), destination
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
+		return (*ninjaV2Dialer)(h).DialContext(ctx, network, destination)
+	case N.NetworkUDP:
+		if !common.Contains(h.Network(), N.NetworkUDP) {
+			return nil, E.New("NinjaV2 UDP is not enabled")
+		}
+		if h.uotClient == nil {
+			return nil, E.New("NinjaV2 UDP requires UDP over TCP")
+		}
+		h.logger.InfoContext(ctx, "outbound UoT connection to ", destination)
+		return h.uotClient.DialContext(ctx, network, destination)
+	default:
+		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	return h.dialPass(ctx, destination)
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if !common.Contains(h.Network(), N.NetworkUDP) {
-		return nil, exceptions.New("NinjaV2 UDP is not enabled")
+		return nil, E.New("NinjaV2 UDP is not enabled")
 	}
-	connection, err := h.dialPass(ctx, destination)
+	if h.uotClient == nil {
+		return nil, E.New("NinjaV2 UDP requires UDP over TCP")
+	}
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
+	return h.uotClient.ListenPacket(ctx, destination)
+}
+
+func (h *Outbound) Close() error {
+	return common.Close(h.transport)
+}
+
+type ninjaV2Dialer Outbound
+
+func (h *ninjaV2Dialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		return nil, E.Extend(N.ErrUnknownNetwork, network)
+	}
+	connection, err := h.transport.DialContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &packetConn{Conn: connection, destination: destination}, nil
-}
-
-func (h *Outbound) dialPass(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	connection, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+	wrapper, err := NewPassConn(connection, h.passMethod, h.passPassword, h.paddingMode, h.paddingMin, h.paddingMax)
 	if err != nil {
+		connection.Close()
 		return nil, err
 	}
-	wrapped, err := NewPassConn(connection, h.method, h.password, h.nodePassword, h.passInfo, h.passVersion, toDestination(destination))
-	if err != nil {
-		_ = connection.Close()
-		return nil, err
-	}
-	return wrapped, nil
+	return ninja.NewClientConn(wrapper, ninja.Credentials{
+		Method: h.coreMethod, Password: h.corePassword, NodePassword: h.nodePassword,
+	}, toNinjaDestination(destination)), nil
 }
 
-type packetConn struct {
-	net.Conn
-	destination M.Socksaddr
+func (h *ninjaV2Dialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, E.New("NinjaV2 packet transport requires UDP over TCP")
 }
 
-func (c *packetConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
-	count, err := c.Read(buffer)
-	return count, c.destination, err
-}
-func (c *packetConn) WriteTo(buffer []byte, _ net.Addr) (int, error) { return c.Write(buffer) }
-func (c *packetConn) SetDeadline(deadline time.Time) error           { return c.Conn.SetDeadline(deadline) }
-func toDestination(destination M.Socksaddr) Destination {
+func toNinjaDestination(destination M.Socksaddr) ninja.Destination {
 	if destination.IsFqdn() {
-		return Destination{Host: destination.Fqdn, Port: destination.Port}
+		return ninja.Destination{Host: destination.Fqdn, Port: destination.Port}
 	}
-	return Destination{Host: destination.Addr.String(), Port: destination.Port}
+	return ninja.Destination{Host: destination.Addr.String(), Port: destination.Port}
 }

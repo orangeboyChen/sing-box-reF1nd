@@ -3,10 +3,11 @@ package ninjav2
 import (
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"sync"
 
@@ -19,155 +20,145 @@ const (
 	passMaxFrame  = 0xffff
 )
 
+var passHKDFInfo = mustDecodeHex("d8b8c066c10e8b0d1b1ba3ad1f7de1525625d03f9d9f682f1bd6097b13a22b38")
+
 type passConn struct {
 	net.Conn
-	readAEAD, writeAEAD   cipher.AEAD
-	readNonce, writeNonce []byte
-	readShake, writeShake io.Reader
-	firstHeader           []byte
-	firstWrite            bool
-	readBuf               []byte
-	writeMu               sync.Mutex
-	master                []byte
-	method                Method
-	keyLength             int
-	destination           Destination
-	sendMaterial          []byte
-	materialSent          bool
-	materialRead          bool
+	method       Method
+	masterKey    []byte
+	verify       []byte
+	paddingMode  string
+	paddingMin   int
+	paddingMax   int
+	network      byte
+	readAEAD     cipher.AEAD
+	writeAEAD    cipher.AEAD
+	readNonce    []byte
+	writeNonce   []byte
+	readShake    io.Reader
+	writeShake   io.Reader
+	readBuffer   []byte
+	readMu       sync.Mutex
+	writeMu      sync.Mutex
+	readStarted  bool
+	writeStarted bool
 }
 
-func NewPassConn(connection net.Conn, method Method, password, nodePassword, passInfo string, version int, destination Destination) (net.Conn, error) {
+func NewPassConn(connection net.Conn, method Method, password, paddingMode string, paddingMin, paddingMax int) (net.Conn, error) {
 	keyLength, err := method.KeyLen()
 	if err != nil {
 		return nil, err
 	}
-	info, err := decodePassInfo(passInfo)
-	if err != nil {
-		return nil, fmt.Errorf("decode NinjaV2 PASS-INFO: %w", err)
-	}
-	if version == 0 {
-		version = 1
-	}
-	masterHash := sha3.Sum512([]byte(passInfo))
-	master := masterHash[:]
-	sendMaterial := make([]byte, 12)
-	if _, err = rand.Read(sendMaterial); err != nil {
-		return nil, err
-	}
-	recvMaterial := make([]byte, 12)
-	readKey, err := passExpandMaterial(master, recvMaterial, "recvAEAD", keyLength)
+	masterKey := kdfPass([]byte(password), keyLength)
+	verify, err := hkdfPass(masterKey, passHKDFInfo, []byte(password), 16)
 	if err != nil {
 		return nil, err
-	}
-	writeKey, err := passExpandMaterial(master, sendMaterial, "sendAEAD", keyLength)
-	if err != nil {
-		return nil, err
-	}
-	readAEAD, err := method.NewAEAD(readKey)
-	if err != nil {
-		return nil, err
-	}
-	writeAEAD, err := method.NewAEAD(writeKey)
-	if err != nil {
-		return nil, err
-	}
-	readMask, err := passExpandMaterial(master, recvMaterial, "readShake", 32)
-	if err != nil {
-		return nil, err
-	}
-	writeMask, err := passExpandMaterial(master, sendMaterial, "writeShake", 32)
-	if err != nil {
-		return nil, err
-	}
-	readShake, writeShake := sha3.NewShake256(), sha3.NewShake256()
-	_, _ = readShake.Write(readMask)
-	_, _ = writeShake.Write(writeMask)
-	firstHeader := make([]byte, 18)
-	copy(firstHeader, info)
-	firstHeader[16] = 3
-	if len(info) > 0x19 {
-		firstHeader[17] = info[0x19]
 	}
 	return &passConn{
-		Conn:        connection,
-		readAEAD:    readAEAD,
-		writeAEAD:   writeAEAD,
-		readNonce:   make([]byte, passNonceSize),
-		writeNonce:  make([]byte, passNonceSize),
-		readShake:   readShake,
-		writeShake:  writeShake,
-		firstHeader: firstHeader,
-		master:      master, method: method, keyLength: keyLength, sendMaterial: sendMaterial, destination: destination,
+		Conn: connection, method: method, masterKey: masterKey, verify: verify,
+		paddingMode: paddingMode, paddingMin: paddingMin, paddingMax: paddingMax,
+		network: 1,
 	}, nil
 }
 
-func passExpand(secret []byte, label string, length int) ([]byte, error) {
-	result := make([]byte, length)
-	_, err := io.ReadFull(hkdf.New(sha3.New512, secret, nil, []byte(label)), result)
-	return result, err
-}
-
-func passExpandMaterial(secret, material []byte, label string, length int) ([]byte, error) {
-	result := make([]byte, length)
-	_, err := io.ReadFull(hkdf.New(sha3.New512, secret, material, []byte(label)), result)
-	return result, err
-}
-
-func decodePassInfo(value string) ([]byte, error) {
-	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-		if decoded, err := encoding.DecodeString(value); err == nil {
-			return decoded, nil
+func kdfPass(password []byte, length int) []byte {
+	result := make([]byte, 0, length)
+	var previous []byte
+	for len(result) < length {
+		hash := sha3.New512()
+		_, _ = hash.Write(previous)
+		_, _ = hash.Write(password)
+		previous = hash.Sum(nil)
+		remaining := length - len(result)
+		if remaining < len(previous) {
+			previous = previous[:remaining]
 		}
+		result = append(result, previous...)
 	}
-	return nil, fmt.Errorf("invalid base64")
+	return result
+}
+
+func hkdfPass(secret, salt, info []byte, length int) ([]byte, error) {
+	result := make([]byte, length)
+	_, err := io.ReadFull(hkdf.New(sha3.New512, secret, salt, info), result)
+	return result, err
+}
+
+func (c *passConn) initializeWrite() ([]byte, error) {
+	salt := make([]byte, passNonceSize)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	key, err := hkdfPass(c.masterKey, salt, passHKDFInfo, len(c.masterKey))
+	if err != nil {
+		return nil, err
+	}
+	c.writeAEAD, err = c.method.NewAEAD(key)
+	if err != nil {
+		return nil, err
+	}
+	shake := sha3.NewShake128()
+	_, _ = shake.Write(salt)
+	_, _ = shake.Write(key)
+	c.writeShake = shake
+	c.writeNonce = append([]byte(nil), salt...)
+	c.writeStarted = true
+	return salt, nil
+}
+
+func (c *passConn) initializeRead() error {
+	salt := make([]byte, passNonceSize)
+	if _, err := io.ReadFull(c.Conn, salt); err != nil {
+		return err
+	}
+	key, err := hkdfPass(c.masterKey, salt, passHKDFInfo, len(c.masterKey))
+	if err != nil {
+		return err
+	}
+	c.readAEAD, err = c.method.NewAEAD(key)
+	if err != nil {
+		return err
+	}
+	shake := sha3.NewShake128()
+	_, _ = shake.Write(salt)
+	_, _ = shake.Write(key)
+	c.readShake = shake
+	c.readNonce = append([]byte(nil), salt...)
+	c.readStarted = true
+	return nil
 }
 
 func (c *passConn) Write(payload []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	originalLength := len(payload)
-	if !c.firstWrite {
-		destination, err := encodeTransportDestination(c.destination)
+	var prefix []byte
+	if !c.writeStarted {
+		var err error
+		prefix, err = c.initializeWrite()
 		if err != nil {
 			return 0, err
 		}
-		initial := make([]byte, 0, len(destination)+len(payload))
-		initial = append(initial, destination...)
+		initial := make([]byte, 0, len(c.verify)+1+len(payload))
+		initial = append(initial, c.verify...)
+		initial = append(initial, c.network)
 		initial = append(initial, payload...)
-		if len(initial)+len(c.firstHeader) > passMaxFrame {
-			return 0, fmt.Errorf("NinjaV2 PASS frame is too large: %d", len(payload)+len(c.firstHeader))
-		}
-		wrapped := make([]byte, 0, len(c.firstHeader)+len(initial))
-		wrapped = append(wrapped, c.firstHeader...)
-		wrapped = append(wrapped, initial...)
-		payload = wrapped
-		c.firstWrite = true
-	}
-	if !c.materialSent {
-		if err := writeAll(c.Conn, c.sendMaterial); err != nil {
-			return 0, err
-		}
-		c.materialSent = true
+		payload = initial
 	}
 	if len(payload) > passMaxFrame {
 		return 0, fmt.Errorf("NinjaV2 PASS frame is too large: %d", len(payload))
 	}
-	paddingLength := 0
-	if remaining := passMaxFrame - len(payload); remaining > 0 {
-		var randomByte [1]byte
-		if _, err := rand.Read(randomByte[:]); err != nil {
-			return 0, err
-		}
-		paddingLength = int(randomByte[0]) % 0x81
-		if paddingLength > remaining {
-			paddingLength = remaining
-		}
+	paddingLength, err := c.paddingLength(len(payload))
+	if err != nil {
+		return 0, err
+	}
+	if paddingLength > passMaxFrame {
+		paddingLength = passMaxFrame
 	}
 	body := make([]byte, len(payload)+paddingLength)
 	copy(body, payload)
-	if paddingLength != 0 {
-		if _, err := rand.Read(body[len(payload):]); err != nil {
+	if paddingLength > 0 {
+		if _, err = rand.Read(body[len(payload):]); err != nil {
 			return 0, err
 		}
 	}
@@ -175,50 +166,63 @@ func (c *passConn) Write(payload []byte) (int, error) {
 	binary.BigEndian.PutUint16(header[:2], uint16(len(payload)))
 	binary.BigEndian.PutUint16(header[2:], uint16(paddingLength))
 	var mask [4]byte
-	if _, err := io.ReadFull(c.writeShake, mask[:]); err != nil {
+	if _, err = io.ReadFull(c.writeShake, mask[:]); err != nil {
 		return 0, err
 	}
-	// The binary reads two big-endian words independently from the shake
-	// stream, reverses them, XORs the fields, then reverses back. This is
-	// equivalent to XORing each network-order field with its corresponding
-	// two shake bytes.
-	for i := 0; i < 4; i++ {
-		header[i] ^= mask[i]
+	for index := range header {
+		header[index] ^= mask[index]
 	}
 	headerCiphertext := c.writeAEAD.Seal(nil, c.writeNonce, header[:], nil)
 	incrementNonce(c.writeNonce)
 	bodyCiphertext := c.writeAEAD.Seal(nil, c.writeNonce, body, nil)
 	incrementNonce(c.writeNonce)
-	if err := writeAll(c.Conn, headerCiphertext, bodyCiphertext); err != nil {
+	if err = writeAll(c.Conn, prefix, headerCiphertext, bodyCiphertext); err != nil {
 		return 0, err
 	}
 	return originalLength, nil
 }
 
-func (c *passConn) Read(buffer []byte) (int, error) {
-	if !c.materialRead {
-		material := make([]byte, passNonceSize)
-		if _, err := io.ReadFull(c.Conn, material); err != nil {
-			return 0, err
-		}
-		key, err := passExpandMaterial(c.master, material, "recvAEAD", c.keyLength)
-		if err != nil {
-			return 0, err
-		}
-		c.readAEAD, err = c.method.NewAEAD(key)
-		if err != nil {
-			return 0, err
-		}
-		mask, err := passExpandMaterial(c.master, material, "readShake", 32)
-		if err != nil {
-			return 0, err
-		}
-		shake := sha3.NewShake256()
-		_, _ = shake.Write(mask)
-		c.readShake = shake
-		c.materialRead = true
+func (c *passConn) paddingLength(payloadLength int) (int, error) {
+	randomMax := c.paddingMax
+	if randomMax <= 0 {
+		randomMax = 128
 	}
-	if len(c.readBuf) == 0 {
+	minimum := c.paddingMin
+	if minimum < 0 {
+		minimum = 0
+	}
+	minimumPadding := minimum - payloadLength
+	if minimumPadding < 0 {
+		minimumPadding = 0
+	}
+	switch c.paddingMode {
+	case "min":
+		return minimumPadding, nil
+	case "min_random":
+		randomPadding, err := cryptoRandomInt(randomMax + 1)
+		return minimumPadding + randomPadding, err
+	default:
+		return cryptoRandomInt(randomMax + 1)
+	}
+}
+
+func cryptoRandomInt(maximum int) (int, error) {
+	value, err := rand.Int(rand.Reader, big.NewInt(int64(maximum)))
+	if err != nil {
+		return 0, err
+	}
+	return int(value.Int64()), nil
+}
+
+func (c *passConn) Read(buffer []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if !c.readStarted {
+		if err := c.initializeRead(); err != nil {
+			return 0, err
+		}
+	}
+	if len(c.readBuffer) == 0 {
 		headerCiphertext := make([]byte, 4+c.readAEAD.Overhead())
 		if _, err := io.ReadFull(c.Conn, headerCiphertext); err != nil {
 			return 0, err
@@ -232,13 +236,13 @@ func (c *passConn) Read(buffer []byte) (int, error) {
 		if _, err = io.ReadFull(c.readShake, mask[:]); err != nil {
 			return 0, err
 		}
-		for i := 0; i < 2; i++ {
-			header[i] ^= mask[i]
-			header[i+2] ^= mask[i+2]
+		for index := range header {
+			header[index] ^= mask[index]
 		}
-		payloadLength, paddingLength := int(binary.BigEndian.Uint16(header[:2])), int(binary.BigEndian.Uint16(header[2:]))
+		payloadLength := int(binary.BigEndian.Uint16(header[:2]))
+		paddingLength := int(binary.BigEndian.Uint16(header[2:]))
 		if payloadLength+paddingLength > passMaxFrame {
-			return 0, fmt.Errorf("invalid NinjaV2 PASS frame length")
+			return 0, fmt.Errorf("invalid NinjaV2 PASS frame length: payload=%d padding=%d", payloadLength, paddingLength)
 		}
 		bodyCiphertext := make([]byte, payloadLength+paddingLength+c.readAEAD.Overhead())
 		if _, err = io.ReadFull(c.Conn, bodyCiphertext); err != nil {
@@ -249,9 +253,17 @@ func (c *passConn) Read(buffer []byte) (int, error) {
 			return 0, fmt.Errorf("decrypt NinjaV2 PASS body: %w", err)
 		}
 		incrementNonce(c.readNonce)
-		c.readBuf = append(c.readBuf, body[:payloadLength]...)
+		c.readBuffer = body[:payloadLength]
 	}
-	count := copy(buffer, c.readBuf)
-	c.readBuf = c.readBuf[count:]
+	count := copy(buffer, c.readBuffer)
+	c.readBuffer = c.readBuffer[count:]
 	return count, nil
+}
+
+func mustDecodeHex(value string) []byte {
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		panic(err)
+	}
+	return decoded
 }
