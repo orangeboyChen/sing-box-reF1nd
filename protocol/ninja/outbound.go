@@ -2,6 +2,7 @@ package ninja
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -138,8 +139,19 @@ type packetConn struct {
 }
 
 func (c *packetConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
-	count, err := c.conn.Read(buffer)
-	return count, c.destination, err
+	payload, err := c.conn.readPacket()
+	if err != nil {
+		return 0, c.destination, err
+	}
+	destination, consumed, err := decodeTransportDestination(payload)
+	if err != nil {
+		return 0, c.destination, fmt.Errorf("decode Ninja UDP response address: %w", err)
+	}
+	if len(payload) == consumed {
+		return 0, c.destination, io.ErrUnexpectedEOF
+	}
+	count := copy(buffer, payload[consumed:])
+	return count, M.ParseSocksaddrHostPort(destination.Host, destination.Port), nil
 }
 
 func (c *packetConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
@@ -215,6 +227,18 @@ func (c *conn) Read(buffer []byte) (int, error) {
 	size := copy(buffer, c.buffer)
 	c.buffer = c.buffer[size:]
 	return size, nil
+}
+
+func (c *conn) readPacket() ([]byte, error) {
+	if err := c.ensureReadSession(); err != nil {
+		return nil, err
+	}
+	if len(c.buffer) != 0 {
+		payload := c.buffer
+		c.buffer = nil
+		return payload, nil
+	}
+	return c.readSession.ReadFrame(c.Conn)
 }
 
 func (c *conn) Write(payload []byte) (int, error) {

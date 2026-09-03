@@ -3,6 +3,8 @@ package ninja
 import (
 	"bytes"
 	"testing"
+
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 func TestRejectsDestinationWithoutPort(t *testing.T) {
@@ -23,6 +25,28 @@ func TestUDPHandshakeUsesNativeNetwork(t *testing.T) {
 	}
 	if header.Network != udpNetwork || destination != (Destination{Host: "1.1.1.1", Port: 53}) || !bytes.Equal(payload, []byte("payload")) {
 		t.Fatalf("unexpected UDP handshake: network=%d destination=%v payload=%q", header.Network, destination, payload)
+	}
+}
+
+func TestUDPResponseStripsDestination(t *testing.T) {
+	connection := &conn{
+		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
+		handshakeDone: make(chan struct{}),
+		readSession:   &Session{},
+		credentials:   Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"},
+	}
+	close(connection.handshakeDone)
+	packet := &packetConn{conn: connection, destination: M.ParseSocksaddr("1.1.1.1:53")}
+	buffer := make([]byte, 32)
+	count, address, err := packet.ReadFrom(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != len("dns-payload") || !bytes.Equal(buffer[:count], []byte("dns-payload")) {
+		t.Fatalf("unexpected UDP payload: %q", buffer[:count])
+	}
+	if address.String() != "1.1.1.1:53" {
+		t.Fatalf("unexpected UDP address: %v", address)
 	}
 }
 
