@@ -81,6 +81,9 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	if options.URL == "" {
 		return nil, E.New("provider URL is required")
 	}
+	if _, err := http.NewRequest(http.MethodGet, options.URL, nil); err != nil {
+		return nil, E.Cause(err, "invalid provider URL")
+	}
 	if options.Path != "" && options.InitialPath != "" {
 		return nil, E.New("provider path and initial_path are mutually exclusive")
 	}
@@ -286,6 +289,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	infoStr := resp.Header.Get("subscription-userinfo")
 	info, hasInfo := parseInfo(infoStr)
 	switch resp.StatusCode {
@@ -327,7 +331,6 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	default:
 		return E.New("unexpected status: ", resp.Status)
 	}
-	defer resp.Body.Close()
 	contentRaw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err

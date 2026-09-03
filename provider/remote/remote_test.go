@@ -3,6 +3,8 @@ package remote
 import (
 	"context"
 	"crypto/sha256"
+	"io"
+	"net/http"
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -36,6 +38,59 @@ func TestProviderRemoteURLHash(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, sha256.Sum256([]byte(providerURL)), provider.(*ProviderRemote).urlHash)
+}
+
+func TestNewProviderRemoteRejectsMalformedURL(t *testing.T) {
+	_, err := NewProviderRemote(
+		context.Background(),
+		nil,
+		log.NewNOPFactory(),
+		"test",
+		option.ProviderRemoteOptions{URL: "https://[::1"},
+	)
+	require.Error(t, err)
+}
+
+func TestProviderRemoteClosesUnexpectedStatusBody(t *testing.T) {
+	body := &trackingBody{}
+	provider := &ProviderRemote{
+		Adapter: providerAdapter.NewAdapter(
+			context.Background(),
+			nil,
+			nil,
+			nil,
+			log.NewNOPFactory(),
+			log.NewNOPFactory().NewLogger("test"),
+			"test",
+			C.ProviderTypeRemote,
+			option.ProviderHealthCheckOptions{},
+		),
+		ctx:    context.Background(),
+		logger: log.NewNOPFactory().NewLogger("test"),
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized", Body: body}, nil
+		})},
+		url: "https://example.com/provider",
+	}
+
+	require.Error(t, provider.fetch(context.Background(), false))
+	require.True(t, body.closed)
+}
+
+type trackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
 
 func TestProviderRemoteRejectsCacheFromDifferentURL(t *testing.T) {
