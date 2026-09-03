@@ -71,6 +71,13 @@ func TestProviderRemoteRejectsCacheFromDifferentURL(t *testing.T) {
 	require.False(t, loaded)
 }
 
+func TestCachedNinjaOutboundRequiresRefetch(t *testing.T) {
+	require.True(t, isNinjaProviderURL("https://example.com/222/ninja/token?tag=ninja"))
+	require.True(t, cachedNinjaOutbound([]byte(`{"outbounds":[{"type":"ninja"}]}`)))
+	require.False(t, cachedNinjaOutbound([]byte(`{"outbounds":[{"type":"ninjav2"}]}`)))
+	require.False(t, isNinjaProviderURL("https://example.com/subscription"))
+}
+
 func TestProviderUserAgent(t *testing.T) {
 	testCases := []struct {
 		name                string

@@ -43,22 +43,23 @@ var _ adapter.Provider = (*ProviderRemote)(nil)
 
 type ProviderRemote struct {
 	provider.Adapter
-	ctx              context.Context
-	cancel           context.CancelFunc
-	logger           log.ContextLogger
-	outbound         adapter.OutboundManager
-	provider         adapter.ProviderManager
-	cacheFile        adapter.CacheFile
-	httpClient       *http.Client
-	hash             hash.HashType
-	infoMu           sync.RWMutex
-	lastEtag         string
-	lastOutOpts      []option.Outbound
-	lastEPOpts       []option.Endpoint
-	lastUpdated      time.Time
-	subscriptionInfo adapter.SubscriptionInfo
-	ticker           *time.Ticker
-	updating         atomic.Bool
+	ctx               context.Context
+	cancel            context.CancelFunc
+	logger            log.ContextLogger
+	outbound          adapter.OutboundManager
+	provider          adapter.ProviderManager
+	cacheFile         adapter.CacheFile
+	httpClient        *http.Client
+	hash              hash.HashType
+	infoMu            sync.RWMutex
+	lastEtag          string
+	forceInitialFetch bool
+	lastOutOpts       []option.Outbound
+	lastEPOpts        []option.Endpoint
+	lastUpdated       time.Time
+	subscriptionInfo  adapter.SubscriptionInfo
+	ticker            *time.Ticker
+	updating          atomic.Bool
 
 	httpClientOptions *option.HTTPClientOptions
 	downloadDetour    string
@@ -193,7 +194,7 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if !loadedFromCache && !loadedFromInitialPath {
+	if (!loadedFromCache && !loadedFromInitialPath) || s.forceInitialFetch {
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
 		err = s.fetch(ctx, true)
 		if err != nil {
@@ -440,12 +441,29 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	} else {
 		return false, nil
 	}
+	forceRefetch := isNinjaProviderURL(s.url) && cachedNinjaOutbound(content)
+	if forceRefetch {
+		s.logger.Info("cached Ninja provider uses legacy outbound type, will refetch")
+	}
 	if err := s.loadFromContent(content); err != nil {
 		return false, err
 	}
 	s.UpdateGroups()
 	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
+	s.forceInitialFetch = forceRefetch
 	return true, nil
+}
+
+func isNinjaProviderURL(providerURL string) bool {
+	parsedURL, err := url.Parse(providerURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsedURL.Query().Get("tag"), "ninja") || strings.Contains(strings.ToLower(parsedURL.Path), "/ninja/")
+}
+
+func cachedNinjaOutbound(content []byte) bool {
+	return bytes.Contains(content, []byte(`"type":"ninja"`)) || bytes.Contains(content, []byte(`"type": "ninja"`))
 }
 
 func (s *ProviderRemote) loadInitialPath() error {
