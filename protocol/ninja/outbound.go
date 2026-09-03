@@ -118,7 +118,18 @@ type conn struct {
 
 // NewClientConn wraps an established transport with the Ninja core protocol.
 func NewClientConn(connection net.Conn, credentials Credentials, destination Destination) net.Conn {
-	return &conn{Conn: connection, credentials: credentials, destination: destination, network: tcpNetwork, handshakeDone: make(chan struct{})}
+	return NewClientConnNetwork(connection, credentials, destination, tcpNetwork)
+}
+
+func NewClientConnNetwork(connection net.Conn, credentials Credentials, destination Destination, network byte) net.Conn {
+	return &conn{Conn: connection, credentials: credentials, destination: destination, network: network, handshakeDone: make(chan struct{})}
+}
+
+func NewClientPacketConn(connection net.Conn, credentials Credentials, destination M.Socksaddr) net.PacketConn {
+	return &packetConn{
+		conn:        &conn{Conn: connection, credentials: credentials, destination: toDestination(destination), network: udpNetwork, handshakeDone: make(chan struct{})},
+		destination: destination,
+	}
 }
 
 type packetConn struct {

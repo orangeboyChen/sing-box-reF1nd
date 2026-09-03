@@ -19,7 +19,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/uot"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
@@ -38,7 +37,6 @@ type Outbound struct {
 	paddingMin   int
 	paddingMax   int
 	nodePassword string
-	uotClient    *uot.Client
 }
 
 func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NinjaV2OutboundOptions) (adapter.Outbound, error) {
@@ -116,10 +114,6 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		paddingMax:   info.Set.PassOptions.PaddingRandomMax,
 		nodePassword: decoded.NodePassword,
 	}
-	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
-	if uotOptions.Enabled {
-		result.uotClient = &uot.Client{Dialer: (*ninjaV2Dialer)(result), Version: uotOptions.Version}
-	}
 	return result, nil
 }
 
@@ -135,11 +129,8 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		if !common.Contains(h.Network(), N.NetworkUDP) {
 			return nil, E.New("NinjaV2 UDP is not enabled")
 		}
-		if h.uotClient == nil {
-			return nil, E.New("NinjaV2 UDP requires UDP over TCP")
-		}
-		h.logger.InfoContext(ctx, "outbound UoT connection to ", destination)
-		return h.uotClient.DialContext(ctx, network, destination)
+		h.logger.InfoContext(ctx, "outbound UDP connection to ", destination)
+		return (*ninjaV2Dialer)(h).DialContext(ctx, network, destination)
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
@@ -149,14 +140,22 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !common.Contains(h.Network(), N.NetworkUDP) {
 		return nil, E.New("NinjaV2 UDP is not enabled")
 	}
-	if h.uotClient == nil {
-		return nil, E.New("NinjaV2 UDP requires UDP over TCP")
-	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
-	return h.uotClient.ListenPacket(ctx, destination)
+	h.logger.InfoContext(ctx, "outbound UDP packet connection to ", destination)
+	connection, err := h.transport.DialContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	wrapper, err := NewPassConn(connection, h.passMethod, h.passPassword, h.paddingMode, h.paddingMin, h.paddingMax)
+	if err != nil {
+		connection.Close()
+		return nil, err
+	}
+	return ninja.NewClientPacketConn(wrapper, ninja.Credentials{
+		Method: h.coreMethod, Password: h.corePassword, NodePassword: h.nodePassword,
+	}, destination), nil
 }
 
 func (h *Outbound) Close() error {
@@ -166,7 +165,8 @@ func (h *Outbound) Close() error {
 type ninjaV2Dialer Outbound
 
 func (h *ninjaV2Dialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	if N.NetworkName(network) != N.NetworkTCP {
+	networkName := N.NetworkName(network)
+	if networkName != N.NetworkTCP && networkName != N.NetworkUDP {
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	connection, err := h.transport.DialContext(ctx)
@@ -178,13 +178,13 @@ func (h *ninjaV2Dialer) DialContext(ctx context.Context, network string, destina
 		connection.Close()
 		return nil, err
 	}
-	return ninja.NewClientConn(wrapper, ninja.Credentials{
+	credentials := ninja.Credentials{
 		Method: h.coreMethod, Password: h.corePassword, NodePassword: h.nodePassword,
-	}, toNinjaDestination(destination)), nil
-}
-
-func (h *ninjaV2Dialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
-	return nil, E.New("NinjaV2 packet transport requires UDP over TCP")
+	}
+	if networkName == N.NetworkUDP {
+		return ninja.NewClientConnNetwork(wrapper, credentials, toNinjaDestination(destination), 2), nil
+	}
+	return ninja.NewClientConn(wrapper, credentials, toNinjaDestination(destination)), nil
 }
 
 func toNinjaDestination(destination M.Socksaddr) ninja.Destination {
