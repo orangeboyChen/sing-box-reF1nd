@@ -66,6 +66,44 @@ func TestPassConnFrames(t *testing.T) {
 	require.True(t, bytes.Equal(followUp, actual))
 }
 
+func TestPassConnSplitsLargeWrite(t *testing.T) {
+	leftRaw, rightRaw := net.Pipe()
+	defer leftRaw.Close()
+	defer rightRaw.Close()
+	left, err := NewPassConn(leftRaw, AES128GCM, "transport-password", "min", 0, 0)
+	require.NoError(t, err)
+	right, err := NewPassConn(rightRaw, AES128GCM, "transport-password", "min", 0, 0)
+	require.NoError(t, err)
+
+	payload := bytes.Repeat([]byte("x"), passMaxFrame+1024)
+	type writeResult struct {
+		count int
+		err   error
+	}
+	result := make(chan writeResult, 1)
+	go func() {
+		count, writeErr := left.Write(payload)
+		result <- writeResult{count: count, err: writeErr}
+	}()
+
+	masterKey := kdfPass([]byte("transport-password"), 16)
+	verify, err := hkdfPass(masterKey, passHKDFInfo, []byte("transport-password"), 16)
+	require.NoError(t, err)
+	expected := append(append(append([]byte(nil), verify...), 1), payload...)
+	actual := make([]byte, 0, len(expected))
+	buffer := make([]byte, 4096)
+	for len(actual) < len(expected) {
+		chunk := make([]byte, len(buffer))
+		count, readErr := right.Read(chunk)
+		require.NoError(t, readErr)
+		actual = append(actual, chunk[:count]...)
+	}
+	writeOutcome := <-result
+	require.NoError(t, writeOutcome.err)
+	require.Equal(t, len(payload), writeOutcome.count)
+	require.Equal(t, expected, actual)
+}
+
 func TestPassVerificationVector(t *testing.T) {
 	password := []byte("12f27790-82c8-4cbf-a804-b7c25a61a92d")
 	verify, err := hkdfPass(kdfPass(password, 16), passHKDFInfo, password, 16)

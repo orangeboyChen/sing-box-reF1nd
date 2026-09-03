@@ -133,6 +133,7 @@ func (c *passConn) Write(payload []byte) (int, error) {
 	defer c.writeMu.Unlock()
 	originalLength := len(payload)
 	var prefix []byte
+	chunkLimit := c.maxPayloadLength()
 	if !c.writeStarted {
 		var err error
 		prefix, err = c.initializeWrite()
@@ -144,13 +145,35 @@ func (c *passConn) Write(payload []byte) (int, error) {
 		initial = append(initial, c.network)
 		initial = append(initial, payload...)
 		payload = initial
+		chunkLimit -= len(c.verify) + 1
+		if chunkLimit <= 0 {
+			return 0, fmt.Errorf("NinjaV2 PASS frame overhead exceeds limit")
+		}
 	}
-	if len(payload) > passMaxFrame {
-		return 0, fmt.Errorf("NinjaV2 PASS frame is too large: %d", len(payload))
+	if len(payload) == 0 {
+		if err := c.writeFrame(prefix, nil); err != nil {
+			return 0, err
+		}
+		return originalLength, nil
 	}
+	for len(payload) > 0 {
+		chunkLength := len(payload)
+		if chunkLength > chunkLimit {
+			chunkLength = chunkLimit
+		}
+		if err := c.writeFrame(prefix, payload[:chunkLength]); err != nil {
+			return 0, err
+		}
+		prefix = nil
+		payload = payload[chunkLength:]
+	}
+	return originalLength, nil
+}
+
+func (c *passConn) writeFrame(prefix, payload []byte) error {
 	paddingLength, err := c.paddingLength(len(payload))
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if paddingLength > passMaxFrame {
 		paddingLength = passMaxFrame
@@ -159,7 +182,7 @@ func (c *passConn) Write(payload []byte) (int, error) {
 	copy(body, payload)
 	if paddingLength > 0 {
 		if _, err = rand.Read(body[len(payload):]); err != nil {
-			return 0, err
+			return err
 		}
 	}
 	var header [4]byte
@@ -167,7 +190,7 @@ func (c *passConn) Write(payload []byte) (int, error) {
 	binary.BigEndian.PutUint16(header[2:], uint16(paddingLength))
 	var mask [4]byte
 	if _, err = io.ReadFull(c.writeShake, mask[:]); err != nil {
-		return 0, err
+		return err
 	}
 	for index := range header {
 		header[index] ^= mask[index]
@@ -177,9 +200,31 @@ func (c *passConn) Write(payload []byte) (int, error) {
 	bodyCiphertext := c.writeAEAD.Seal(nil, c.writeNonce, body, nil)
 	incrementNonce(c.writeNonce)
 	if err = writeAll(c.Conn, prefix, headerCiphertext, bodyCiphertext); err != nil {
-		return 0, err
+		return err
 	}
-	return originalLength, nil
+	return nil
+}
+
+func (c *passConn) maxPayloadLength() int {
+	paddingMax := c.paddingMax
+	if paddingMax <= 0 {
+		paddingMax = 128
+	}
+	switch c.paddingMode {
+	case "min":
+		paddingMax = c.paddingMin
+	case "min_random":
+		if c.paddingMin > 0 {
+			paddingMax += c.paddingMin
+		}
+	}
+	if paddingMax < 0 {
+		paddingMax = 0
+	}
+	if paddingMax > passMaxFrame {
+		paddingMax = passMaxFrame
+	}
+	return passMaxFrame - paddingMax
 }
 
 func (c *passConn) paddingLength(payloadLength int) (int, error) {
