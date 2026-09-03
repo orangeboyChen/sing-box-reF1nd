@@ -9,6 +9,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/sagernet/sing-box/option"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,6 +28,15 @@ func TestPassInfoDecode(t *testing.T) {
 		require.Equal(t, "microsoft.com", info.Set.WebsocketOptions.Headers["Host"])
 		require.Equal(t, "new.example", info.replaceServer("old.example"))
 	}
+}
+
+func TestEffectiveTLSOptions(t *testing.T) {
+	info := &passInfo{}
+	info.Set.TLS = true
+	info.Set.ServerName = "pass.example"
+	info.Set.SkipCertVerify = true
+	require.Equal(t, option.OutboundTLSOptions{Enabled: true, ServerName: "pass.example", Insecure: true}, effectiveTLSOptions(info, nil))
+	require.Equal(t, option.OutboundTLSOptions{ServerName: "override.example"}, effectiveTLSOptions(info, &option.OutboundTLSOptions{ServerName: "override.example"}))
 }
 
 func TestPassConnFrames(t *testing.T) {

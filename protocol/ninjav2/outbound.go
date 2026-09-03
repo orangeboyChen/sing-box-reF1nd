@@ -80,7 +80,7 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 	if err != nil {
 		return nil, err
 	}
-	tlsOptions := option.OutboundTLSOptions{Enabled: info.Set.TLS, ServerName: info.Set.ServerName, Insecure: info.Set.SkipCertVerify}
+	tlsOptions := effectiveTLSOptions(info, options.TLS)
 	var tlsConfig boxTLS.Config
 	if tlsOptions.Enabled {
 		tlsConfig, err = boxTLS.NewClient(ctx, logger, options.Server, tlsOptions)
@@ -115,6 +115,17 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		nodePassword: decoded.NodePassword,
 	}
 	return result, nil
+}
+
+func effectiveTLSOptions(info *passInfo, configured *option.OutboundTLSOptions) option.OutboundTLSOptions {
+	if configured != nil {
+		return *configured
+	}
+	return option.OutboundTLSOptions{
+		Enabled:    info.Set.TLS,
+		ServerName: info.Set.ServerName,
+		Insecure:   info.Set.SkipCertVerify,
+	}
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
