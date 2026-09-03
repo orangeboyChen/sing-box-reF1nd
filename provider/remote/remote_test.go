@@ -3,6 +3,8 @@ package remote
 import (
 	"context"
 	"crypto/sha256"
+	"io"
+	"net/http"
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -38,6 +40,59 @@ func TestProviderRemoteURLHash(t *testing.T) {
 	require.Equal(t, sha256.Sum256([]byte(providerURL)), provider.(*ProviderRemote).urlHash)
 }
 
+func TestNewProviderRemoteRejectsMalformedURL(t *testing.T) {
+	_, err := NewProviderRemote(
+		context.Background(),
+		nil,
+		log.NewNOPFactory(),
+		"test",
+		option.ProviderRemoteOptions{URL: "https://[::1"},
+	)
+	require.Error(t, err)
+}
+
+func TestProviderRemoteClosesUnexpectedStatusBody(t *testing.T) {
+	body := &trackingBody{}
+	provider := &ProviderRemote{
+		Adapter: providerAdapter.NewAdapter(
+			context.Background(),
+			nil,
+			nil,
+			nil,
+			log.NewNOPFactory(),
+			log.NewNOPFactory().NewLogger("test"),
+			"test",
+			C.ProviderTypeRemote,
+			option.ProviderHealthCheckOptions{},
+		),
+		ctx:    context.Background(),
+		logger: log.NewNOPFactory().NewLogger("test"),
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized", Body: body}, nil
+		})},
+		url: "https://example.com/provider",
+	}
+
+	require.Error(t, provider.fetch(context.Background(), false))
+	require.True(t, body.closed)
+}
+
+type trackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
 func TestProviderRemoteRejectsCacheFromDifferentURL(t *testing.T) {
 	t.Parallel()
 
@@ -71,6 +126,13 @@ func TestProviderRemoteRejectsCacheFromDifferentURL(t *testing.T) {
 	require.False(t, loaded)
 }
 
+func TestCachedNinjaOutboundRequiresRefetch(t *testing.T) {
+	require.True(t, isNinjaProviderURL("https://example.com/222/ninja/token?tag=ninja"))
+	require.True(t, cachedNinjaOutbound([]byte(`{"outbounds":[{"type":"ninja"}]}`)))
+	require.False(t, cachedNinjaOutbound([]byte(`{"outbounds":[{"type":"ninjav2"}]}`)))
+	require.False(t, isNinjaProviderURL("https://example.com/subscription"))
+}
+
 func TestProviderUserAgent(t *testing.T) {
 	testCases := []struct {
 		name                string
@@ -81,18 +143,28 @@ func TestProviderUserAgent(t *testing.T) {
 		{
 			name:        "ninja tag",
 			providerURL: "https://example.com/subscription?tag=ninja",
-			expected:    "clash-ninja/openwrt",
+			expected:    "clash-ninja/v2.4.0",
 		},
 		{
 			name:        "case insensitive ninja tag",
 			providerURL: "https://example.com/subscription?tag=NINJA",
-			expected:    "clash-ninja/openwrt",
+			expected:    "clash-ninja/v2.4.0",
 		},
 		{
 			name:                "ninja tag takes priority over configured user agent",
 			providerURL:         "https://example.com/subscription?tag=ninja",
 			configuredUserAgent: "custom-agent",
-			expected:            "clash-ninja/openwrt",
+			expected:            "clash-ninja/v2.4.0",
+		},
+		{
+			name:        "ninja path",
+			providerURL: "https://example.com/222/ninja/token",
+			expected:    "clash-ninja/v2.4.0",
+		},
+		{
+			name:        "case insensitive ninja path",
+			providerURL: "https://example.com/222/NINJA/token",
+			expected:    "clash-ninja/v2.4.0",
 		},
 		{
 			name:        "default user agent",

@@ -43,22 +43,23 @@ var _ adapter.Provider = (*ProviderRemote)(nil)
 
 type ProviderRemote struct {
 	provider.Adapter
-	ctx              context.Context
-	cancel           context.CancelFunc
-	logger           log.ContextLogger
-	outbound         adapter.OutboundManager
-	provider         adapter.ProviderManager
-	cacheFile        adapter.CacheFile
-	httpClient       *http.Client
-	hash             hash.HashType
-	infoMu           sync.RWMutex
-	lastEtag         string
-	lastOutOpts      []option.Outbound
-	lastEPOpts       []option.Endpoint
-	lastUpdated      time.Time
-	subscriptionInfo adapter.SubscriptionInfo
-	ticker           *time.Ticker
-	updating         atomic.Bool
+	ctx               context.Context
+	cancel            context.CancelFunc
+	logger            log.ContextLogger
+	outbound          adapter.OutboundManager
+	provider          adapter.ProviderManager
+	cacheFile         adapter.CacheFile
+	httpClient        *http.Client
+	hash              hash.HashType
+	infoMu            sync.RWMutex
+	lastEtag          string
+	forceInitialFetch bool
+	lastOutOpts       []option.Outbound
+	lastEPOpts        []option.Endpoint
+	lastUpdated       time.Time
+	subscriptionInfo  adapter.SubscriptionInfo
+	ticker            *time.Ticker
+	updating          atomic.Bool
 
 	httpClientOptions *option.HTTPClientOptions
 	downloadDetour    string
@@ -79,6 +80,9 @@ type ProviderRemote struct {
 func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderRemoteOptions) (adapter.Provider, error) {
 	if options.URL == "" {
 		return nil, E.New("provider URL is required")
+	}
+	if _, err := http.NewRequest(http.MethodGet, options.URL, nil); err != nil {
+		return nil, E.Cause(err, "invalid provider URL")
 	}
 	if options.Path != "" && options.InitialPath != "" {
 		return nil, E.New("provider path and initial_path are mutually exclusive")
@@ -158,8 +162,10 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 func providerUserAgent(providerURL string, configuredUserAgent string) string {
 	parsedURL, err := url.Parse(providerURL)
-	if err == nil && strings.EqualFold(parsedURL.Query().Get("tag"), "ninja") {
-		return "clash-ninja/openwrt"
+	if err == nil {
+		if strings.EqualFold(parsedURL.Query().Get("tag"), "ninja") || strings.Contains(strings.ToLower(parsedURL.Path), "/ninja/") {
+			return "clash-ninja/v2.4.0"
+		}
 	}
 	if configuredUserAgent != "" {
 		return configuredUserAgent
@@ -191,11 +197,11 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if !loadedFromCache && !loadedFromInitialPath {
+	if (!loadedFromCache && !loadedFromInitialPath) || s.forceInitialFetch {
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
 		err = s.fetch(ctx, true)
 		if err != nil {
-			return E.Cause(err, "initial outbound provider: ", s.Tag())
+			s.logger.Error(E.Cause(err, "initial outbound provider: ", s.Tag(), ", will retry in ", s.updateInterval))
 		}
 	}
 	s.ticker = time.NewTicker(s.updateInterval)
@@ -283,6 +289,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	infoStr := resp.Header.Get("subscription-userinfo")
 	info, hasInfo := parseInfo(infoStr)
 	switch resp.StatusCode {
@@ -324,7 +331,6 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	default:
 		return E.New("unexpected status: ", resp.Status)
 	}
-	defer resp.Body.Close()
 	contentRaw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -438,12 +444,29 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	} else {
 		return false, nil
 	}
+	forceRefetch := isNinjaProviderURL(s.url) && cachedNinjaOutbound(content)
+	if forceRefetch {
+		s.logger.Info("cached Ninja provider uses legacy outbound type, will refetch")
+	}
 	if err := s.loadFromContent(content); err != nil {
 		return false, err
 	}
 	s.UpdateGroups()
 	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
+	s.forceInitialFetch = forceRefetch
 	return true, nil
+}
+
+func isNinjaProviderURL(providerURL string) bool {
+	parsedURL, err := url.Parse(providerURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsedURL.Query().Get("tag"), "ninja") || strings.Contains(strings.ToLower(parsedURL.Path), "/ninja/")
+}
+
+func cachedNinjaOutbound(content []byte) bool {
+	return bytes.Contains(content, []byte(`"type":"ninja"`)) || bytes.Contains(content, []byte(`"type": "ninja"`))
 }
 
 func (s *ProviderRemote) loadInitialPath() error {
