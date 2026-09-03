@@ -151,8 +151,15 @@ func (c *packetConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 	return count, M.ParseSocksaddrHostPort(destination.Host, destination.Port), nil
 }
 
-func (c *packetConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
-	return c.conn.Write(buffer)
+func (c *packetConn) WriteTo(buffer []byte, address net.Addr) (int, error) {
+	destination := c.conn.destination
+	if address != nil {
+		socksaddr := M.SocksaddrFromNet(address)
+		if socksaddr.IsFqdn() || socksaddr.Port != 0 {
+			destination = toDestination(socksaddr)
+		}
+	}
+	return c.conn.WriteTo(buffer, destination)
 }
 
 func (c *packetConn) Close() error { return c.conn.Close() }
@@ -229,16 +236,7 @@ func (c *conn) Read(buffer []byte) (int, error) {
 		}
 		c.buffer = payload
 	}
-	payload := c.buffer
-	if c.network == udpNetwork {
-		_, payload, err := decodeUDPResponse(payload)
-		if err != nil {
-			return 0, fmt.Errorf("decode Ninja UDP response address: %w", err)
-		}
-		c.buffer = nil
-		return copy(buffer, payload), nil
-	}
-	size := copy(buffer, payload)
+	size := copy(buffer, c.buffer)
 	c.buffer = c.buffer[size:]
 	return size, nil
 }
@@ -267,11 +265,16 @@ func decodeUDPResponse(payload []byte) (Destination, []byte, error) {
 }
 
 func (c *conn) Write(payload []byte) (int, error) {
+	return c.WriteTo(payload, c.destination)
+}
+
+func (c *conn) WriteTo(payload []byte, destination Destination) (int, error) {
 	c.writeAccess.Lock()
 	defer c.writeAccess.Unlock()
 	originalLength := len(payload)
 	if c.writeSession == nil {
 		if c.network == udpNetwork {
+			c.destination = destination
 			if err := c.startLocked(payload); err != nil {
 				return 0, err
 			}
@@ -292,8 +295,11 @@ func (c *conn) Write(payload []byte) (int, error) {
 		}
 	}
 	if c.network == udpNetwork {
-		if len(payload) > 0xffff {
+		if len(payload) > maxCorePayload {
 			return 0, fmt.Errorf("Ninja UDP datagram is too large: %d", len(payload))
+		}
+		if destination != c.destination {
+			return 0, fmt.Errorf("Ninja UDP destination changed after connection setup")
 		}
 		if err := c.writeSession.WriteFrame(c.Conn, payload); err != nil {
 			return 0, err
@@ -302,8 +308,8 @@ func (c *conn) Write(payload []byte) (int, error) {
 	}
 	for len(payload) > 0 {
 		chunkLength := len(payload)
-		if chunkLength > 0xffff {
-			chunkLength = 0xffff
+		if chunkLength > maxCorePayload {
+			chunkLength = maxCorePayload
 		}
 		if err := c.writeSession.WriteFrame(c.Conn, payload[:chunkLength]); err != nil {
 			return 0, err
@@ -322,7 +328,11 @@ func (c *conn) initialPayloadLimit() (int, error) {
 	if c.network == udpNetwork {
 		paddingLength = 1
 	}
-	return 0xffff - len(destination) - 2 - paddingLength, nil
+	limit := maxCorePayload
+	if handshakeLimit := 0xffff - len(destination) - 2 - paddingLength; handshakeLimit < limit {
+		limit = handshakeLimit
+	}
+	return limit, nil
 }
 
 type saltCaptureWriter struct {

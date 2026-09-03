@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"time"
 
@@ -18,6 +19,7 @@ const (
 	authenticatorSize = aes.BlockSize
 	tcpNetwork        = 1
 	udpNetwork        = 2
+	maxCorePayload    = 0x3fff
 )
 
 type Credentials struct {
@@ -280,9 +282,37 @@ func (session *Session) WriteFrame(writer io.Writer, payload []byte) error {
 	if len(payload) > 0xffff {
 		return fmt.Errorf("Ninja frame is too large: %d", len(payload))
 	}
+	paddingLength, err := randomPaddingLength(len(payload))
+	if err != nil {
+		return err
+	}
 	length := make([]byte, 4)
-	binary.BigEndian.PutUint16(length, uint16(len(payload)))
-	return writeAll(writer, session.seal(length), session.seal(payload))
+	binary.BigEndian.PutUint16(length, uint16(len(payload)+paddingLength))
+	binary.BigEndian.PutUint16(length[2:], uint16(paddingLength))
+	paddedPayload := make([]byte, len(payload)+paddingLength)
+	copy(paddedPayload, payload)
+	if paddingLength > 0 {
+		if _, err := rand.Read(paddedPayload[len(payload):]); err != nil {
+			return fmt.Errorf("generate Ninja frame padding: %w", err)
+		}
+	}
+	return writeAll(writer, session.seal(length), session.seal(paddedPayload))
+}
+
+func randomPaddingLength(payloadLength int) (int, error) {
+	available := 0xffff - payloadLength
+	if available <= 0 {
+		return 0, nil
+	}
+	maximum := 900
+	if available < maximum {
+		maximum = available
+	}
+	value, err := rand.Int(rand.Reader, big.NewInt(int64(maximum)))
+	if err != nil {
+		return 0, fmt.Errorf("generate Ninja frame padding length: %w", err)
+	}
+	return int(value.Int64()), nil
 }
 func (session *Session) ReadFrame(reader io.Reader) ([]byte, error) {
 	lengthCiphertext := make([]byte, 4+session.aead.Overhead())
