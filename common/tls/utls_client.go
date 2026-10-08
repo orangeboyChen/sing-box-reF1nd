@@ -175,23 +175,32 @@ type utlsALPNWrapper struct {
 }
 
 func (c *utlsALPNWrapper) HandshakeContext(ctx context.Context) error {
-	if len(c.nextProtocols) > 0 {
-		err := c.BuildHandshakeState()
-		if err != nil {
-			return err
-		}
-		for _, extension := range c.Extensions {
-			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
-				alpnExtension.AlpnProtocols = c.nextProtocols
-				err = c.BuildHandshakeState()
-				if err != nil {
-					return err
-				}
-				break
-			}
-		}
+	if err := c.prepareALPN(); err != nil {
+		return err
 	}
 	return c.UConn.HandshakeContext(ctx)
+}
+
+func (c *utlsALPNWrapper) prepareALPN() error {
+	if len(c.nextProtocols) == 0 {
+		return nil
+	}
+	if err := c.BuildHandshakeState(); err != nil {
+		return err
+	}
+	var alpnExtension *utls.ALPNExtension
+	for _, extension := range c.Extensions {
+		if candidate, isALPN := extension.(*utls.ALPNExtension); isALPN {
+			alpnExtension = candidate
+			break
+		}
+	}
+	if alpnExtension == nil {
+		alpnExtension = &utls.ALPNExtension{}
+		c.Extensions = append(c.Extensions, alpnExtension)
+	}
+	alpnExtension.AlpnProtocols = c.nextProtocols
+	return c.BuildHandshakeState()
 }
 
 func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {

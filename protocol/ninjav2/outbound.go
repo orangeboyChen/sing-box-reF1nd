@@ -21,6 +21,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+const websocketALPN = "cs-gw1"
+
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.NinjaV2OutboundOptions](registry, C.TypeNinjaV2, NewOutbound)
 }
@@ -87,6 +89,9 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		if err != nil {
 			return nil, err
 		}
+		if tlsConfig != nil {
+			tlsConfig.SetNextProtos([]string{websocketALPN})
+		}
 	}
 	headers := make(badoption.HTTPHeader, len(info.Set.WebsocketOptions.Headers))
 	for name, value := range info.Set.WebsocketOptions.Headers {
@@ -118,14 +123,23 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 }
 
 func effectiveTLSOptions(info *passInfo, configured *option.OutboundTLSOptions) option.OutboundTLSOptions {
-	if configured != nil {
-		return *configured
-	}
-	return option.OutboundTLSOptions{
+	result := option.OutboundTLSOptions{
 		Enabled:    info.Set.TLS,
 		ServerName: info.Set.ServerName,
 		Insecure:   info.Set.SkipCertVerify,
 	}
+	if configured == nil {
+		return result
+	}
+	result = *configured
+	result.Enabled = result.Enabled || info.Set.TLS
+	if result.ServerName == "" {
+		result.ServerName = info.Set.ServerName
+	}
+	if !result.Insecure {
+		result.Insecure = info.Set.SkipCertVerify
+	}
+	return result
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

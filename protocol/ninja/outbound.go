@@ -11,15 +11,19 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
+	boxTLS "github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
+
+const websocketALPN = "cs-gw1"
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.NinjaOutboundOptions](registry, C.TypeNinja, NewOutbound)
@@ -31,6 +35,8 @@ type Outbound struct {
 	dialer      N.Dialer
 	serverAddr  M.Socksaddr
 	credentials Credentials
+	tlsDialer   boxTLS.Dialer
+	transport   adapter.V2RayClientTransport
 }
 
 func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NinjaOutboundOptions) (adapter.Outbound, error) {
@@ -64,7 +70,39 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		serverAddr:  options.ServerOptions.Build(),
 		credentials: Credentials{Method: method, Password: options.Password, NodePassword: options.NodePassword},
 	}
+	var tlsConfig boxTLS.Config
+	if options.TLS != nil {
+		tlsConfig, err = boxTLS.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
+		if err != nil {
+			return nil, err
+		}
+		if tlsConfig != nil {
+			h.tlsDialer = boxTLS.NewDialer(outboundDialer, tlsConfig)
+		}
+	}
+	if options.Transport != nil {
+		if options.Transport.Type != C.V2RayTransportTypeWebsocket {
+			return nil, exceptions.New("unsupported Ninja transport: ", options.Transport.Type)
+		}
+		if tlsConfig != nil {
+			tlsConfig.SetNextProtos([]string{websocketALPN})
+		}
+		h.transport, err = v2ray.NewClientTransport(ctx, outboundDialer, h.serverAddr, common.PtrValueOrDefault(options.Transport), tlsConfig)
+		if err != nil {
+			return nil, exceptions.Cause(err, "create Ninja client transport")
+		}
+	}
 	return h, nil
+}
+
+func (h *Outbound) dialServer(ctx context.Context) (net.Conn, error) {
+	if h.transport != nil {
+		return h.transport.DialContext(ctx)
+	}
+	if h.tlsDialer != nil {
+		return h.tlsDialer.DialTLSContext(ctx, h.serverAddr)
+	}
+	return h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -72,7 +110,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		if !common.Contains(h.Network(), N.NetworkUDP) {
 			return nil, exceptions.New("Ninja UDP is not enabled")
 		}
-		connection, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+		connection, err := h.dialServer(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -84,7 +122,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound, metadata.Destination = h.Tag(), destination
 	h.logger.InfoContext(ctx, "outbound connection to ", destination)
-	connection, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+	connection, err := h.dialServer(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -95,11 +133,15 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !common.Contains(h.Network(), N.NetworkUDP) {
 		return nil, exceptions.New("Ninja UDP is not enabled")
 	}
-	connection, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+	connection, err := h.dialServer(ctx)
 	if err != nil {
 		return nil, err
 	}
 	return &packetConn{conn: &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), network: udpNetwork, handshakeDone: make(chan struct{})}, destination: destination}, nil
+}
+
+func (h *Outbound) Close() error {
+	return common.Close(h.transport)
 }
 
 type conn struct {

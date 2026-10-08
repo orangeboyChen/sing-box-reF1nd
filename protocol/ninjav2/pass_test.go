@@ -36,7 +36,7 @@ func TestEffectiveTLSOptions(t *testing.T) {
 	info.Set.ServerName = "pass.example"
 	info.Set.SkipCertVerify = true
 	require.Equal(t, option.OutboundTLSOptions{Enabled: true, ServerName: "pass.example", Insecure: true}, effectiveTLSOptions(info, nil))
-	require.Equal(t, option.OutboundTLSOptions{ServerName: "override.example"}, effectiveTLSOptions(info, &option.OutboundTLSOptions{ServerName: "override.example"}))
+	require.Equal(t, option.OutboundTLSOptions{Enabled: true, ServerName: "override.example", Insecure: true}, effectiveTLSOptions(info, &option.OutboundTLSOptions{ServerName: "override.example"}))
 }
 
 func TestPassConnFrames(t *testing.T) {

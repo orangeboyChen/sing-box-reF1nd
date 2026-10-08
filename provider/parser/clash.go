@@ -112,18 +112,27 @@ type NinjaOption struct {
 	DialerOptions     `yaml:",inline"`
 	ServerOptions     `yaml:",inline"`
 	TLSOptions        `yaml:",inline"`
-	Method            string `yaml:"method"`
-	Password          string `yaml:"password"`
-	NodePassword      string `yaml:"node_password"`
-	UDP               bool   `yaml:"udp,omitempty"`
-	UDPOverTCP        bool   `yaml:"udp-over-tcp,omitempty"`
-	UDPOverTCPVersion int    `yaml:"udp-over-tcp-version,omitempty"`
-	PassInfo          string `yaml:"pass-info,omitempty"`
-	PassVersion       int    `yaml:"passversion,omitempty"`
-	Protocol          string `yaml:"-"`
+	Method            string    `yaml:"method"`
+	Password          string    `yaml:"password"`
+	NodePassword      string    `yaml:"node_password"`
+	UDP               bool      `yaml:"udp,omitempty"`
+	UDPOverTCP        bool      `yaml:"udp-over-tcp,omitempty"`
+	UDPOverTCPVersion int       `yaml:"udp-over-tcp-version,omitempty"`
+	Network           string    `yaml:"network,omitempty"`
+	ServerName        string    `yaml:"servername,omitempty"`
+	WSOpts            WSOptions `yaml:"ws-opts,omitempty"`
+	PassInfo          string    `yaml:"pass-info,omitempty"`
+	PassVersion       int       `yaml:"passversion,omitempty"`
+	Protocol          string    `yaml:"-"`
 }
 
 func (n *NinjaOption) Build() any {
+	if n.ServerName != "" {
+		n.SNI = n.ServerName
+	}
+	if n.TLS && n.ClientFingerprint == "" {
+		n.ClientFingerprint = "chrome"
+	}
 	if n.Protocol == C.TypeNinjaV2 {
 		return &option.NinjaV2OutboundOptions{
 			DialerOptions:               n.DialerOptions.Build(),
@@ -139,16 +148,18 @@ func (n *NinjaOption) Build() any {
 		}
 	}
 	return &option.NinjaOutboundOptions{
-		DialerOptions: n.DialerOptions.Build(),
-		ServerOptions: n.ServerOptions.Build(),
-		Method:        n.Method,
-		Password:      n.Password,
-		NodePassword:  n.NodePassword,
-		UDP:           n.UDP,
+		DialerOptions:               n.DialerOptions.Build(),
+		ServerOptions:               n.ServerOptions.Build(),
+		OutboundTLSOptionsContainer: clashTLSOptions(n.Server, &n.TLSOptions),
+		Method:                      n.Method,
+		Password:                    n.Password,
+		NodePassword:                n.NodePassword,
+		UDP:                         n.UDP,
 		UDPOverTCP: &option.UDPOverTCPOptions{
 			Enabled: n.UDPOverTCP,
 			Version: uint8(n.UDPOverTCPVersion),
 		},
+		Transport: clashTransport(n.Network, HTTPOptions{}, HTTP2Options{}, GrpcOptions{}, n.WSOpts),
 	}
 }
 
