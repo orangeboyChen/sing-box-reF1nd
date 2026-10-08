@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	providerAdapter "github.com/sagernet/sing-box/adapter/provider"
@@ -49,6 +50,33 @@ func TestNewProviderRemoteRejectsMalformedURL(t *testing.T) {
 		option.ProviderRemoteOptions{URL: "https://[::1"},
 	)
 	require.Error(t, err)
+}
+
+func TestProviderRemoteRequestTimeout(t *testing.T) {
+	provider := &ProviderRemote{
+		Adapter: providerAdapter.NewAdapter(
+			context.Background(),
+			nil,
+			nil,
+			nil,
+			log.NewNOPFactory(),
+			log.NewNOPFactory().NewLogger("test"),
+			"test",
+			C.ProviderTypeRemote,
+			option.ProviderHealthCheckOptions{},
+		),
+		ctx:            context.Background(),
+		logger:         log.NewNOPFactory().NewLogger("test"),
+		requestTimeout: 10 * time.Millisecond,
+		httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		})},
+		url: "https://example.com/provider",
+	}
+
+	err := provider.fetch(context.Background(), false)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestProviderRemoteClosesUnexpectedStatusBody(t *testing.T) {
