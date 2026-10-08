@@ -64,3 +64,48 @@ func TestOverrideAnyTLSOptions(t *testing.T) {
 		})
 	}
 }
+
+func TestOverrideNinjaTLSOptions(t *testing.T) {
+	for _, outbound := range []option.Outbound{
+		{
+			Type: C.TypeNinja,
+			Options: &option.NinjaOutboundOptions{
+				OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+					TLS: &option.OutboundTLSOptions{Enabled: true, ServerName: "original.example"},
+				},
+			},
+		},
+		{
+			Type: C.TypeNinjaV2,
+			Options: &option.NinjaV2OutboundOptions{
+				OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+					TLS: &option.OutboundTLSOptions{Enabled: true, ServerName: "original.example"},
+				},
+			},
+		},
+	} {
+		t.Run(outbound.Type, func(t *testing.T) {
+			outbounds := overrideOutbounds(
+				[]option.Outbound{outbound},
+				nil,
+				&option.OverrideTLSOptions{
+					ServerName: common.Ptr("override.example"),
+					Insecure:   common.Ptr(true),
+				},
+				nil,
+				nil,
+				"",
+			)
+			var tlsOptions *option.OutboundTLSOptions
+			switch options := outbounds[0].Options.(type) {
+			case *option.NinjaOutboundOptions:
+				tlsOptions = options.TLS
+			case *option.NinjaV2OutboundOptions:
+				tlsOptions = options.TLS
+			}
+			require.NotNil(t, tlsOptions)
+			require.Equal(t, "override.example", tlsOptions.ServerName)
+			require.True(t, tlsOptions.Insecure)
+		})
+	}
+}

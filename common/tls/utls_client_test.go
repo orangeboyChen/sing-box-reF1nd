@@ -122,3 +122,30 @@ func TestUTLSClient_Client_BothFragment_Wraps(t *testing.T) {
 	_, isTF := wrapped.NetConn().(*tf.Conn)
 	require.True(t, isTF, "both fragment flags: must wrap with tf.Conn")
 }
+
+func TestUTLSALPNWrapperAddsMissingExtension(t *testing.T) {
+	t.Parallel()
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	uConn := utls.UClient(client, &utls.Config{ServerName: "example.com", InsecureSkipVerify: true}, utls.HelloChrome_Auto)
+	require.NoError(t, uConn.BuildHandshakeState())
+	removedALPN := false
+	for index, extension := range uConn.Extensions {
+		if _, isALPN := extension.(*utls.ALPNExtension); isALPN {
+			uConn.Extensions = append(uConn.Extensions[:index], uConn.Extensions[index+1:]...)
+			removedALPN = true
+			break
+		}
+	}
+	require.True(t, removedALPN)
+	wrapper := &utlsALPNWrapper{utlsConnWrapper{uConn}, []string{"cs-gw1"}}
+	require.NoError(t, wrapper.prepareALPN())
+	for _, extension := range wrapper.Extensions {
+		if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+			require.Equal(t, []string{"cs-gw1"}, alpnExtension.AlpnProtocols)
+			return
+		}
+	}
+	t.Fatal("ALPN extension was not added")
+}

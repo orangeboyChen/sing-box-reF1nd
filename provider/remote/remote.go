@@ -39,6 +39,8 @@ func RegisterProvider(registry *provider.Registry) {
 	provider.Register[option.ProviderRemoteOptions](registry, C.ProviderTypeRemote, NewProviderRemote)
 }
 
+const defaultProviderRequestTimeout = 30 * time.Second
+
 var _ adapter.Provider = (*ProviderRemote)(nil)
 
 type ProviderRemote struct {
@@ -69,6 +71,7 @@ type ProviderRemote struct {
 	initialPath       string
 	userAgent         string
 	updateInterval    time.Duration
+	requestTimeout    time.Duration
 	exclude           *regexp.Regexp
 	include           *regexp.Regexp
 
@@ -148,6 +151,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		initialPath:       initialPath,
 		userAgent:         userAgent,
 		updateInterval:    updateInterval,
+		requestTimeout:    defaultProviderRequestTimeout,
 		exclude:           (*regexp.Regexp)(options.Exclude),
 		include:           (*regexp.Regexp)(options.Include),
 
@@ -273,6 +277,12 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		return E.New("provider is updating")
 	}
 	defer s.updating.Store(false)
+	requestTimeout := s.requestTimeout
+	if requestTimeout <= 0 {
+		requestTimeout = defaultProviderRequestTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
 	s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
 	req, err := http.NewRequest(http.MethodGet, s.url, nil)
 	if err != nil {

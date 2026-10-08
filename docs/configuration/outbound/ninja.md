@@ -8,7 +8,22 @@
   "server_port": 443,
   "method": "aes-128-gcm",
   "password": "password",
-  "node_password": "node-password"
+  "node_password": "node-password",
+  "tls": {
+    "enabled": true,
+    "server_name": "front.example.com",
+    "utls": {
+      "enabled": true,
+      "fingerprint": "chrome"
+    }
+  },
+  "transport": {
+    "type": "ws",
+    "path": "/ninja",
+    "headers": {
+      "Host": "front.example.com"
+    }
+  }
 }
 ```
 
@@ -17,6 +32,14 @@ UDP-over-TCP v2 when `udp` and `udp-over-tcp` are enabled. `method` supports `ae
 `aes-256-gcm`, and `chacha20-ietf-poly1305`.
 
 Ninja subscription node envelopes are decoded when the outbound is created.
+
+`tls` uses the shared [outbound TLS configuration](/configuration/shared/tls/#outbound).
+When WebSocket and TLS are enabled together, sing-box advertises the Ninja
+gateway ALPN `cs-gw1` and applies it to the generated uTLS ClientHello.
+
+Only the WebSocket V2Ray transport is supported. See
+[V2Ray Transport](/configuration/shared/v2ray-transport/) for `transport`
+fields.
 
 ## Provider
 
@@ -55,3 +78,7 @@ updates take effect when the surrounding configuration is reloaded. The URL
 must include `tag=ninja` to request the Ninja subscription format. Such remote
 providers use `clash-ninja/openwrt` as their default `User-Agent`; set
 `user_agent` to override it.
+
+The provider converter maps the Clash-compatible `network`, `tls`,
+`skip-cert-verify`, `servername`, `client-fingerprint`, and `ws-opts` fields.
+TLS nodes without `client-fingerprint` use the `chrome` uTLS fingerprint.

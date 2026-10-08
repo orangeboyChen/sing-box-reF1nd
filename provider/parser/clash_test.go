@@ -64,6 +64,14 @@ proxies:
     method: aes-128-gcm
     password: password
     node_password: node-password
+    network: ws
+    tls: true
+    skip-cert-verify: true
+    servername: front.example
+    ws-opts:
+      path: /ninja
+      headers:
+        Host: ws.example
 proxy-groups:
   - name: ignored
     type: select
@@ -81,6 +89,16 @@ rules:
 	require.Equal(t, "aes-128-gcm", ninjaOptions.Method)
 	require.Equal(t, "password", ninjaOptions.Password)
 	require.Equal(t, "node-password", ninjaOptions.NodePassword)
+	require.NotNil(t, ninjaOptions.TLS)
+	require.True(t, ninjaOptions.TLS.Enabled)
+	require.True(t, ninjaOptions.TLS.Insecure)
+	require.Equal(t, "front.example", ninjaOptions.TLS.ServerName)
+	require.NotNil(t, ninjaOptions.TLS.UTLS)
+	require.Equal(t, "chrome", ninjaOptions.TLS.UTLS.Fingerprint)
+	require.NotNil(t, ninjaOptions.Transport)
+	require.Equal(t, "ws", ninjaOptions.Transport.Type)
+	require.Equal(t, "/ninja", ninjaOptions.Transport.WebsocketOptions.Path)
+	require.Equal(t, "ws.example", ninjaOptions.Transport.WebsocketOptions.Headers["Host"][0])
 }
 
 func TestParseClashNinjaV2PassInfo(t *testing.T) {
