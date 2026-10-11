@@ -241,6 +241,14 @@ func (c *conn) startLocked(payload []byte) error {
 func (c *conn) ensureReadSession() error {
 	c.writeAccess.Lock()
 	if c.writeSession == nil {
+		if c.network == udpNetwork {
+			c.writeAccess.Unlock()
+			<-c.handshakeDone
+			if c.handshakeErr != nil {
+				return c.handshakeErr
+			}
+			return c.initializeReadSession()
+		}
 		if err := c.startLocked(nil); err != nil {
 			c.writeAccess.Unlock()
 			return err
@@ -251,6 +259,10 @@ func (c *conn) ensureReadSession() error {
 	if c.handshakeErr != nil {
 		return c.handshakeErr
 	}
+	return c.initializeReadSession()
+}
+
+func (c *conn) initializeReadSession() error {
 	if c.readSession != nil {
 		return nil
 	}

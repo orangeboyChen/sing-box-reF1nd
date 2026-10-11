@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net"
 	"testing"
+	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -125,6 +126,67 @@ func TestReadStartsHandshake(t *testing.T) {
 	}
 	if err = <-serverDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUDPReadWaitsForInitialWrite(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	client := NewClientPacketConn(clientRaw, credentials, M.ParseSocksaddr("1.1.1.1:53"))
+
+	type readResult struct {
+		payload []byte
+		err     error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		buffer := make([]byte, 64)
+		count, _, err := client.ReadFrom(buffer)
+		readDone <- readResult{payload: append([]byte(nil), buffer[:count]...), err: err}
+	}()
+
+	if err := serverRaw.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var firstByte [1]byte
+	if _, err := serverRaw.Read(firstByte[:]); err == nil {
+		t.Fatal("UDP read sent an empty handshake before the first packet")
+	} else if timeoutError, loaded := err.(net.Error); !loaded || !timeoutError.Timeout() {
+		t.Fatalf("unexpected pre-write read error: %v", err)
+	}
+	if err := serverRaw.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte("dns-query")
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := client.WriteTo(payload, nil)
+		writeDone <- err
+	}()
+
+	_, header, _, initialPayload, err := credentials.ReadClientHandshake(serverRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(initialPayload, payload) {
+		t.Fatalf("UDP packet was not carried by the initial handshake: %q", initialPayload)
+	}
+	response := append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-response")...)
+	if _, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response}); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	result := <-readDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if !bytes.Equal(result.payload, []byte("dns-response")) {
+		t.Fatalf("unexpected UDP response: %q", result.payload)
 	}
 }
 
