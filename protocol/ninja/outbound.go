@@ -253,18 +253,7 @@ func (c *oneShotPacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 	}
 }
 
-func (c *oneShotPacketConn) WriteTo(buffer []byte, address net.Addr) (int, error) {
-	destination := c.destination
-	if address != nil {
-		socksaddr := M.SocksaddrFromNet(address)
-		if socksaddr.IsFqdn() || socksaddr.Port != 0 {
-			destination = socksaddr
-		}
-	}
-	if destination != c.destination {
-		return 0, fmt.Errorf("Ninja UDP destination changed after connection setup")
-	}
-
+func (c *oneShotPacketConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
 	c.access.Lock()
 	if c.closed {
 		c.access.Unlock()
@@ -314,8 +303,8 @@ func (c *oneShotPacketConn) WriteTo(buffer []byte, address net.Addr) (int, error
 	}
 	c.access.Unlock()
 
-	ninjaConn := newConn(connection, c.credentials, toDestination(destination), udpNetwork)
-	count, err := ninjaConn.WriteTo(buffer, toDestination(destination))
+	ninjaConn := newConn(connection, c.credentials, toDestination(c.destination), udpNetwork)
+	count, err := ninjaConn.WriteTo(buffer, toDestination(c.destination))
 	if err != nil {
 		c.removeConnection(connection)
 		operationCancel()
@@ -426,15 +415,8 @@ func (c *packetConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 	return count, M.ParseSocksaddrHostPort(destination.Host, destination.Port), nil
 }
 
-func (c *packetConn) WriteTo(buffer []byte, address net.Addr) (int, error) {
-	destination := c.conn.destination
-	if address != nil {
-		socksaddr := M.SocksaddrFromNet(address)
-		if socksaddr.IsFqdn() || socksaddr.Port != 0 {
-			destination = toDestination(socksaddr)
-		}
-	}
-	return c.conn.WriteTo(buffer, destination)
+func (c *packetConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
+	return c.conn.WriteTo(buffer, c.conn.destination)
 }
 
 func (c *packetConn) Close() error { return c.conn.Close() }

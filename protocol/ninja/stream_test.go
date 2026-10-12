@@ -89,6 +89,66 @@ func TestUDPFirstWriteIsCoalesced(t *testing.T) {
 	}
 }
 
+func TestUDPWritePreservesBoundDomainDestination(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	destination := M.ParseSocksaddr("stun.example.test:3478")
+	client := NewClientPacketConn(clientRaw, credentials, destination)
+	payload := []byte("udp-payload")
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := client.WriteTo(payload, &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 3478})
+		writeResult <- err
+	}()
+
+	_, header, decodedDestination, initialPayload, err := credentials.ReadClientHandshake(serverRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = <-writeResult; err != nil {
+		t.Fatal(err)
+	}
+	if header.Network != udpNetwork || decodedDestination != (Destination{Host: "stun.example.test", Port: 3478}) {
+		t.Fatalf("unexpected UDP handshake: network=%d destination=%v", header.Network, decodedDestination)
+	}
+	if !bytes.Equal(initialPayload, payload) {
+		t.Fatalf("unexpected UDP initial payload: %q", initialPayload)
+	}
+}
+
+func TestDNSWritePreservesBoundDomainDestination(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("dns.example.test:53")
+	serverResult := make(chan error, 1)
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		go func() {
+			defer serverRaw.Close()
+			_, _, decodedDestination, payload, readErr := credentials.ReadClientHandshake(serverRaw)
+			if readErr == nil && decodedDestination != (Destination{Host: "dns.example.test", Port: 53}) {
+				readErr = errors.New("DNS handshake did not preserve the bound domain destination")
+			}
+			if readErr == nil && !bytes.Equal(payload, []byte("dns-query")) {
+				readErr = errors.New("DNS handshake did not preserve the query payload")
+			}
+			serverResult <- readErr
+		}()
+		return clientRaw, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err = client.WriteTo([]byte("dns-query"), &net.UDPAddr{IP: net.ParseIP("192.0.2.53"), Port: 53}); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUDPResponseStripsDestination(t *testing.T) {
 	connection := &conn{
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
