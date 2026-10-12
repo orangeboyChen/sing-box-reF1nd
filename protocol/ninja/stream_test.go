@@ -2,9 +2,11 @@ package ninja
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,6 +228,95 @@ func TestUDPReadWaitsForInitialWriteDeadline(t *testing.T) {
 		t.Fatal("deadline wait sent an empty UDP handshake")
 	} else if timeoutError, loaded := err.(net.Error); !loaded || !timeoutError.Timeout() {
 		t.Fatalf("unexpected server read error: %v", err)
+	}
+}
+
+func TestUDPClientPacketConnUsesStreamPerPacket(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("1.1.1.1:53")
+	var dialCount atomic.Int32
+	serverErrors := make(chan error, 2)
+	dialer := func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			_, header, _, payload, err := credentials.ReadClientHandshake(serverRaw)
+			if err != nil {
+				serverErrors <- err
+				return
+			}
+			response := append([]byte{1, 1, 1, 1, 1, 0, 53}, payload...)
+			_, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
+			serverErrors <- err
+		}()
+		return clientRaw, nil
+	}
+	client, err := NewClientPacketConnWithDialer(context.Background(), dialer, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	writeErrors := make(chan error, 2)
+	for _, payload := range [][]byte{[]byte("first-query"), []byte("second-query")} {
+		go func() {
+			count, err := client.WriteTo(payload, nil)
+			if err == nil && count != len(payload) {
+				err = errors.New("unexpected write count")
+			}
+			writeErrors <- err
+		}()
+	}
+	for range 2 {
+		if err := <-writeErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	responses := make(map[string]bool)
+	for range 2 {
+		buffer := make([]byte, 64)
+		count, address, err := client.ReadFrom(buffer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if address.String() != destination.String() {
+			t.Fatalf("unexpected response address: %v", address)
+		}
+		responses[string(buffer[:count])] = true
+	}
+	if !responses["first-query"] || !responses["second-query"] {
+		t.Fatalf("unexpected responses: %v", responses)
+	}
+	if dialCount.Load() != 2 {
+		t.Fatalf("expected one Ninja stream per packet, got %d streams", dialCount.Load())
+	}
+	for range 2 {
+		if err := <-serverErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUDPClientPacketConnKeepsPersistentStreamOutsideDNS(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer serverRaw.Close()
+	var dialCount atomic.Int32
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		dialCount.Add(1)
+		return clientRaw, nil
+	}, credentials, M.ParseSocksaddr("1.1.1.1:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, loaded := client.(*packetConn); !loaded {
+		t.Fatal("non-DNS UDP did not keep the persistent Ninja packet connection")
+	}
+	if dialCount.Load() != 1 {
+		t.Fatalf("expected one persistent Ninja stream, got %d", dialCount.Load())
 	}
 }
 

@@ -169,18 +169,22 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "outbound UDP packet connection to ", destination)
-	connection, err := h.transport.DialContext(ctx)
-	if err != nil {
-		return nil, err
+	dialPacketStream := func(ctx context.Context) (net.Conn, error) {
+		connection, err := h.transport.DialContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		wrapper, err := NewPassConn(connection, h.passMethod, h.passPassword, h.paddingMode, h.paddingMin, h.paddingMax)
+		if err != nil {
+			connection.Close()
+			return nil, err
+		}
+		return wrapper, nil
 	}
-	wrapper, err := NewPassConn(connection, h.passMethod, h.passPassword, h.paddingMode, h.paddingMin, h.paddingMax)
-	if err != nil {
-		connection.Close()
-		return nil, err
-	}
-	return ninja.NewClientPacketConn(wrapper, ninja.Credentials{
+	credentials := ninja.Credentials{
 		Method: h.coreMethod, Password: h.corePassword, NodePassword: h.nodePassword,
-	}, destination), nil
+	}
+	return ninja.NewClientPacketConnWithDialer(ctx, dialPacketStream, credentials, destination)
 }
 
 func (h *Outbound) Close() error {
