@@ -15,12 +15,35 @@ import (
 )
 
 const (
-	headerSize        = 12
-	authenticatorSize = aes.BlockSize
-	tcpNetwork        = 1
-	udpNetwork        = 2
-	maxCorePayload    = 0x3fff
+	headerSize         = 12
+	authenticatorSize  = aes.BlockSize
+	tcpNetwork         = 1
+	udpNetwork         = 2
+	maxCorePayload     = 0x3fff
+	firstBlockTarget   = 877
+	firstBlockMaxPad   = 900
+	tcpWriteBufferSize = 0x8000
 )
+
+func planFirstBlock(overhead int, existingPayloadLength int) (paddingLength int, payloadLength int, err error) {
+	available := firstBlockTarget - overhead - existingPayloadLength
+	if available > firstBlockMaxPad {
+		available = firstBlockMaxPad
+	}
+	if available <= 0 {
+		return 1, existingPayloadLength, nil
+	}
+	value, err := rand.Int(rand.Reader, big.NewInt(int64(available)))
+	if err != nil {
+		return 0, 0, fmt.Errorf("plan initial Ninja block: %w", err)
+	}
+	paddingLength = int(value.Int64()) + 1
+	payloadLength = firstBlockTarget - overhead - paddingLength + 1
+	if payloadLength < existingPayloadLength {
+		payloadLength = existingPayloadLength
+	}
+	return paddingLength, payloadLength, nil
+}
 
 type Credentials struct {
 	Method       Method

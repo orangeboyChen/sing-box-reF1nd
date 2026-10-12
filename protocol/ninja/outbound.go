@@ -1,6 +1,7 @@
 package ninja
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -135,11 +136,7 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !common.Contains(h.Network(), N.NetworkUDP) {
 		return nil, exceptions.New("Ninja UDP is not enabled")
 	}
-	connection, err := h.dialServer(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return &packetConn{conn: newConn(connection, h.credentials, toDestination(destination), udpNetwork), destination: destination}, nil
+	return NewClientPacketConnWithDialer(ctx, h.dialServer, h.credentials, destination)
 }
 
 func (h *Outbound) Close() error {
@@ -189,6 +186,217 @@ func NewClientPacketConn(connection net.Conn, credentials Credentials, destinati
 	}
 }
 
+type packetDialer func(ctx context.Context) (net.Conn, error)
+
+type packetResult struct {
+	payload     []byte
+	destination M.Socksaddr
+	err         error
+}
+
+type oneShotPacketConn struct {
+	ctx            context.Context
+	cancel         context.CancelFunc
+	dialer         packetDialer
+	credentials    Credentials
+	destination    M.Socksaddr
+	results        chan packetResult
+	readDeadline   pipe.Deadline
+	access         sync.Mutex
+	connections    map[net.Conn]struct{}
+	localAddr      net.Addr
+	readDeadlineAt time.Time
+	writeDeadline  time.Time
+	closed         bool
+}
+
+// NewClientPacketConnWithDialer creates a compatible Ninja UDP packet connection.
+// Some Ninja servers stop forwarding DNS after the first response on a
+// persistent stream, so port 53 uses one Ninja stream per query.
+func NewClientPacketConnWithDialer(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) (net.PacketConn, error) {
+	if destination.Port != 53 {
+		connection, err := dialer(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return NewClientPacketConn(connection, credentials, destination), nil
+	}
+	return newClientOneShotPacketConn(ctx, dialer, credentials, destination), nil
+}
+
+func newClientOneShotPacketConn(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) net.PacketConn {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	return &oneShotPacketConn{
+		ctx:          ctx,
+		cancel:       cancel,
+		dialer:       dialer,
+		credentials:  credentials,
+		destination:  destination,
+		results:      make(chan packetResult, 64),
+		readDeadline: pipe.MakeDeadline(),
+		connections:  make(map[net.Conn]struct{}),
+	}
+}
+
+func (c *oneShotPacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
+	select {
+	case result := <-c.results:
+		if result.err != nil {
+			return 0, result.destination, result.err
+		}
+		count := copy(buffer, result.payload)
+		return count, result.destination, nil
+	case <-c.ctx.Done():
+		return 0, nil, net.ErrClosed
+	case <-c.readDeadline.Wait():
+		return 0, nil, os.ErrDeadlineExceeded
+	}
+}
+
+func (c *oneShotPacketConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return 0, net.ErrClosed
+	}
+	writeDeadline := c.writeDeadline
+	c.access.Unlock()
+
+	operationCtx, operationCancel := context.WithCancel(c.ctx)
+	dialCtx := operationCtx
+	dialCancel := func() {}
+	if !writeDeadline.IsZero() {
+		dialCtx, dialCancel = context.WithDeadline(operationCtx, writeDeadline)
+	}
+	connection, err := c.dialer(dialCtx)
+	dialCancel()
+	if err != nil {
+		operationCancel()
+		return 0, err
+	}
+	if !writeDeadline.IsZero() {
+		if err = connection.SetWriteDeadline(writeDeadline); err != nil {
+			operationCancel()
+			connection.Close()
+			return 0, err
+		}
+	}
+
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		operationCancel()
+		connection.Close()
+		return 0, net.ErrClosed
+	}
+	if !c.readDeadlineAt.IsZero() {
+		if err = connection.SetReadDeadline(c.readDeadlineAt); err != nil {
+			c.access.Unlock()
+			operationCancel()
+			connection.Close()
+			return 0, err
+		}
+	}
+	c.connections[connection] = struct{}{}
+	if c.localAddr == nil {
+		c.localAddr = connection.LocalAddr()
+	}
+	c.access.Unlock()
+
+	ninjaConn := newConn(connection, c.credentials, toDestination(c.destination), udpNetwork)
+	count, err := ninjaConn.WriteTo(buffer, toDestination(c.destination))
+	if err != nil {
+		c.removeConnection(connection)
+		operationCancel()
+		connection.Close()
+		return count, err
+	}
+	go c.readOnePacket(operationCtx, operationCancel, connection, ninjaConn)
+	return count, nil
+}
+
+func (c *oneShotPacketConn) readOnePacket(operationCtx context.Context, operationCancel context.CancelFunc, connection net.Conn, ninjaConn *conn) {
+	defer operationCancel()
+	defer connection.Close()
+	defer c.removeConnection(connection)
+	payload, err := ninjaConn.readPacket()
+	result := packetResult{destination: c.destination, err: err}
+	if err == nil {
+		var responseDestination Destination
+		responseDestination, result.payload, result.err = decodeUDPResponse(payload)
+		if result.err == nil {
+			result.destination = M.ParseSocksaddrHostPort(responseDestination.Host, responseDestination.Port)
+		}
+	}
+	select {
+	case c.results <- result:
+	case <-operationCtx.Done():
+	case <-c.ctx.Done():
+	}
+}
+
+func (c *oneShotPacketConn) removeConnection(connection net.Conn) {
+	c.access.Lock()
+	delete(c.connections, connection)
+	c.access.Unlock()
+}
+
+func (c *oneShotPacketConn) Close() error {
+	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return nil
+	}
+	c.closed = true
+	c.cancel()
+	connections := make([]net.Conn, 0, len(c.connections))
+	for connection := range c.connections {
+		connections = append(connections, connection)
+	}
+	c.access.Unlock()
+	for _, connection := range connections {
+		connection.Close()
+	}
+	return nil
+}
+
+func (c *oneShotPacketConn) LocalAddr() net.Addr {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.localAddr != nil {
+		return c.localAddr
+	}
+	return M.Socksaddr{}
+}
+
+func (c *oneShotPacketConn) SetDeadline(deadline time.Time) error {
+	if err := c.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(deadline)
+}
+
+func (c *oneShotPacketConn) SetReadDeadline(deadline time.Time) error {
+	c.readDeadline.Set(deadline)
+	c.access.Lock()
+	c.readDeadlineAt = deadline
+	var deadlineErr error
+	for connection := range c.connections {
+		if err := connection.SetReadDeadline(deadline); err != nil && deadlineErr == nil {
+			deadlineErr = err
+		}
+	}
+	c.access.Unlock()
+	return deadlineErr
+}
+
+func (c *oneShotPacketConn) SetWriteDeadline(deadline time.Time) error {
+	c.access.Lock()
+	c.writeDeadline = deadline
+	c.access.Unlock()
+	return nil
+}
+
 type packetConn struct {
 	conn        *conn
 	destination M.Socksaddr
@@ -207,15 +415,8 @@ func (c *packetConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 	return count, M.ParseSocksaddrHostPort(destination.Host, destination.Port), nil
 }
 
-func (c *packetConn) WriteTo(buffer []byte, address net.Addr) (int, error) {
-	destination := c.conn.destination
-	if address != nil {
-		socksaddr := M.SocksaddrFromNet(address)
-		if socksaddr.IsFqdn() || socksaddr.Port != 0 {
-			destination = toDestination(socksaddr)
-		}
-	}
-	return c.conn.WriteTo(buffer, destination)
+func (c *packetConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
+	return c.conn.WriteTo(buffer, c.conn.destination)
 }
 
 func (c *packetConn) Close() error { return c.conn.Close() }
@@ -248,16 +449,65 @@ func (c *conn) SetReadDeadline(deadline time.Time) error {
 	return nil
 }
 
-func (c *conn) startLocked(payload []byte) error {
+func (c *conn) startUDPWriteLocked(payload []byte) error {
 	if c.writeSession != nil {
 		return nil
 	}
-	capture := &saltCaptureWriter{Writer: c.Conn}
-	paddingLength := 0
-	if c.network == udpNetwork {
-		paddingLength = 1
+	destination, err := encodeTransportDestination(c.destination)
+	if err != nil {
+		return err
 	}
+	paddingLength, _, err := planFirstBlock(len(destination), len(payload))
+	if err != nil {
+		return err
+	}
+	var wire bytes.Buffer
+	capture := &saltCaptureWriter{Writer: &wire}
 	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload, paddingLength)
+	if err == nil {
+		err = writeAll(c.Conn, wire.Bytes())
+	}
+	c.handshakeOnce.Do(func() {
+		c.handshakeErr = err
+		if err == nil {
+			c.writeSession, c.clientSalt = writeSession, capture.salt
+		}
+		close(c.handshakeDone)
+	})
+	return c.handshakeErr
+}
+
+func (c *conn) startTCPWriteLocked(payload []byte) error {
+	paddingLength, initialLength, err := c.planFirstBlock(0)
+	if err != nil {
+		return err
+	}
+	if initialLength > len(payload) {
+		initialLength = len(payload)
+	}
+	var wire bytes.Buffer
+	capture := &saltCaptureWriter{Writer: &wire}
+	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload[:initialLength], paddingLength)
+	remaining := payload[initialLength:]
+	for err == nil && len(remaining) > 0 {
+		chunkLength := len(remaining)
+		if chunkLength > maxCorePayload {
+			chunkLength = maxCorePayload
+		}
+		var frame bytes.Buffer
+		err = writeSession.WriteFrame(&frame, remaining[:chunkLength])
+		if err == nil && wire.Len()+frame.Len() > tcpWriteBufferSize {
+			err = writeAll(c.Conn, wire.Bytes())
+			wire.Reset()
+		}
+		if err == nil {
+			_, err = wire.Write(frame.Bytes())
+		}
+		remaining = remaining[chunkLength:]
+	}
+	if err == nil {
+		err = writeAll(c.Conn, wire.Bytes())
+	}
 	c.handshakeOnce.Do(func() {
 		c.handshakeErr = err
 		if err == nil {
@@ -283,7 +533,7 @@ func (c *conn) ensureReadSession() error {
 			}
 			return c.initializeReadSession()
 		}
-		if err := c.startLocked(nil); err != nil {
+		if err := c.startTCPWriteLocked(nil); err != nil {
 			c.writeAccess.Unlock()
 			return err
 		}
@@ -363,24 +613,15 @@ func (c *conn) WriteTo(payload []byte, destination Destination) (int, error) {
 	if c.writeSession == nil {
 		if c.network == udpNetwork {
 			c.destination = destination
-			if err := c.startLocked(payload); err != nil {
+			if err := c.startUDPWriteLocked(payload); err != nil {
 				return 0, err
 			}
 			return len(payload), nil
 		}
-		initialLimit, err := c.initialPayloadLimit()
-		if err != nil {
+		if err := c.startTCPWriteLocked(payload); err != nil {
 			return 0, err
 		}
-		if len(payload) <= initialLimit {
-			if err := c.startLocked(payload); err != nil {
-				return 0, err
-			}
-			return len(payload), nil
-		}
-		if err := c.startLocked(nil); err != nil {
-			return 0, err
-		}
+		return originalLength, nil
 	}
 	if c.network == udpNetwork {
 		if len(payload) > maxCorePayload {
@@ -407,20 +648,12 @@ func (c *conn) WriteTo(payload []byte, destination Destination) (int, error) {
 	return originalLength, nil
 }
 
-func (c *conn) initialPayloadLimit() (int, error) {
+func (c *conn) planFirstBlock(existingPayloadLength int) (paddingLength int, payloadLength int, err error) {
 	destination, err := encodeTransportDestination(c.destination)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	paddingLength := 0
-	if c.network == udpNetwork {
-		paddingLength = 1
-	}
-	limit := maxCorePayload
-	if handshakeLimit := 0xffff - len(destination) - 2 - paddingLength; handshakeLimit < limit {
-		limit = handshakeLimit
-	}
-	return limit, nil
+	return planFirstBlock(len(destination), existingPayloadLength)
 }
 
 type saltCaptureWriter struct {
