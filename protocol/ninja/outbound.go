@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/pipe"
 )
 
 const websocketALPN = "cs-gw1"
@@ -114,7 +116,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		if err != nil {
 			return nil, err
 		}
-		return &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), network: udpNetwork, handshakeDone: make(chan struct{})}, nil
+		return newConn(connection, h.credentials, toDestination(destination), udpNetwork), nil
 	}
 	if N.NetworkName(network) != N.NetworkTCP {
 		return nil, exceptions.Extend(N.ErrUnknownNetwork, network)
@@ -126,7 +128,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	if err != nil {
 		return nil, err
 	}
-	return &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), network: tcpNetwork, handshakeDone: make(chan struct{})}, nil
+	return newConn(connection, h.credentials, toDestination(destination), tcpNetwork), nil
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -137,7 +139,7 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if err != nil {
 		return nil, err
 	}
-	return &packetConn{conn: &conn{Conn: connection, credentials: h.credentials, destination: toDestination(destination), network: udpNetwork, handshakeDone: make(chan struct{})}, destination: destination}, nil
+	return &packetConn{conn: newConn(connection, h.credentials, toDestination(destination), udpNetwork), destination: destination}, nil
 }
 
 func (h *Outbound) Close() error {
@@ -157,6 +159,18 @@ type conn struct {
 	handshakeDone chan struct{}
 	handshakeOnce sync.Once
 	handshakeErr  error
+	readDeadline  pipe.Deadline
+}
+
+func newConn(connection net.Conn, credentials Credentials, destination Destination, network byte) *conn {
+	return &conn{
+		Conn:          connection,
+		credentials:   credentials,
+		destination:   destination,
+		network:       network,
+		handshakeDone: make(chan struct{}),
+		readDeadline:  pipe.MakeDeadline(),
+	}
 }
 
 // NewClientConn wraps an established transport with the Ninja core protocol.
@@ -165,12 +179,12 @@ func NewClientConn(connection net.Conn, credentials Credentials, destination Des
 }
 
 func NewClientConnNetwork(connection net.Conn, credentials Credentials, destination Destination, network byte) net.Conn {
-	return &conn{Conn: connection, credentials: credentials, destination: destination, network: network, handshakeDone: make(chan struct{})}
+	return newConn(connection, credentials, destination, network)
 }
 
 func NewClientPacketConn(connection net.Conn, credentials Credentials, destination M.Socksaddr) net.PacketConn {
 	return &packetConn{
-		conn:        &conn{Conn: connection, credentials: credentials, destination: toDestination(destination), network: udpNetwork, handshakeDone: make(chan struct{})},
+		conn:        newConn(connection, credentials, toDestination(destination), udpNetwork),
 		destination: destination,
 	}
 }
@@ -218,6 +232,22 @@ func (c *packetConn) SetWriteDeadline(deadline time.Time) error {
 	return c.conn.SetWriteDeadline(deadline)
 }
 
+func (c *conn) SetDeadline(deadline time.Time) error {
+	if err := c.Conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	c.readDeadline.Set(deadline)
+	return nil
+}
+
+func (c *conn) SetReadDeadline(deadline time.Time) error {
+	if err := c.Conn.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	c.readDeadline.Set(deadline)
+	return nil
+}
+
 func (c *conn) startLocked(payload []byte) error {
 	if c.writeSession != nil {
 		return nil
@@ -241,6 +271,18 @@ func (c *conn) startLocked(payload []byte) error {
 func (c *conn) ensureReadSession() error {
 	c.writeAccess.Lock()
 	if c.writeSession == nil {
+		if c.network == udpNetwork {
+			c.writeAccess.Unlock()
+			select {
+			case <-c.handshakeDone:
+			case <-c.readDeadline.Wait():
+				return os.ErrDeadlineExceeded
+			}
+			if c.handshakeErr != nil {
+				return c.handshakeErr
+			}
+			return c.initializeReadSession()
+		}
 		if err := c.startLocked(nil); err != nil {
 			c.writeAccess.Unlock()
 			return err
@@ -251,6 +293,10 @@ func (c *conn) ensureReadSession() error {
 	if c.handshakeErr != nil {
 		return c.handshakeErr
 	}
+	return c.initializeReadSession()
+}
+
+func (c *conn) initializeReadSession() error {
 	if c.readSession != nil {
 		return nil
 	}
