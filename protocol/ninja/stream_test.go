@@ -13,6 +13,16 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
+type countingWriteConn struct {
+	net.Conn
+	writeCount atomic.Int32
+}
+
+func (c *countingWriteConn) Write(payload []byte) (int, error) {
+	c.writeCount.Add(1)
+	return c.Conn.Write(payload)
+}
+
 func TestRejectsDestinationWithoutPort(t *testing.T) {
 	if _, err := encodeTransportDestination(Destination{Host: "example.test"}); err == nil {
 		t.Fatal("regular destination without port was accepted")
@@ -299,6 +309,90 @@ func TestUDPClientPacketConnUsesStreamPerPacket(t *testing.T) {
 	}
 }
 
+func TestUDPClientPacketConnOutlivesDialContext(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("1.1.1.1:53")
+	ctx, cancel := context.WithCancel(context.Background())
+	serverErrors := make(chan error, 1)
+	client, err := NewClientPacketConnWithDialer(ctx, func(dialCtx context.Context) (net.Conn, error) {
+		if err := dialCtx.Err(); err != nil {
+			return nil, err
+		}
+		clientRaw, serverRaw := net.Pipe()
+		go func() {
+			defer serverRaw.Close()
+			_, header, _, payload, err := credentials.ReadClientHandshake(serverRaw)
+			if err == nil {
+				response := append([]byte{1, 1, 1, 1, 1, 0, 53}, payload...)
+				_, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
+			}
+			serverErrors <- err
+		}()
+		return clientRaw, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	cancel()
+	if _, err = client.WriteTo([]byte("query"), nil); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 32)
+	count, _, err := client.ReadFrom(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer[:count], []byte("query")) {
+		t.Fatalf("unexpected response: %q", buffer[:count])
+	}
+	if err = <-serverErrors; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUDPClientPacketConnReadDeadlineClosesStream(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("1.1.1.1:53")
+	serverClosed := make(chan error, 1)
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		go func() {
+			defer serverRaw.Close()
+			if _, _, _, _, err := credentials.ReadClientHandshake(serverRaw); err != nil {
+				serverClosed <- err
+				return
+			}
+			var buffer [1]byte
+			_, err := serverRaw.Read(buffer[:])
+			serverClosed <- err
+		}()
+		return clientRaw, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err = client.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.WriteTo([]byte("query"), nil); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 32)
+	if _, _, err = client.ReadFrom(buffer); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("unexpected read error: %v", err)
+	}
+	select {
+	case err = <-serverClosed:
+		if err == nil {
+			t.Fatal("server stream remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deadline did not close the one-shot stream")
+	}
+}
+
 func TestUDPClientPacketConnKeepsPersistentStreamOutsideDNS(t *testing.T) {
 	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
 	clientRaw, serverRaw := net.Pipe()
@@ -342,10 +436,10 @@ func TestLargeTCPWriteSplitsNinjaFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(initial) != 0 {
+	if len(initial) == 0 || len(initial) > firstBlockTarget {
 		t.Fatalf("unexpected initial payload length: %d", len(initial))
 	}
-	received := make([]byte, 0, len(payload))
+	received := append(make([]byte, 0, len(payload)), initial...)
 	for len(received) < len(payload) {
 		frame, readErr := reader.ReadFrame(serverRaw)
 		if readErr != nil {
@@ -359,6 +453,62 @@ func TestLargeTCPWriteSplitsNinjaFrames(t *testing.T) {
 	}
 	if result.count != len(payload) || !bytes.Equal(received, payload) {
 		t.Fatalf("large write mismatch: count=%d payload=%d received=%d", result.count, len(payload), len(received))
+	}
+}
+
+func TestTCPFirstWriteIsCoalesced(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	recorder := &countingWriteConn{Conn: clientRaw}
+	client := NewClientConn(recorder, credentials, Destination{Host: "example.test", Port: 443})
+	payload := bytes.Repeat([]byte("x"), 2048)
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := client.Write(payload)
+		writeResult <- err
+	}()
+	reader, _, _, initial, err := credentials.ReadClientHandshake(serverRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := append(make([]byte, 0, len(payload)), initial...)
+	for len(received) < len(payload) {
+		frame, readErr := reader.ReadFrame(serverRaw)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		received = append(received, frame...)
+	}
+	if err = <-writeResult; err != nil {
+		t.Fatal(err)
+	}
+	if recorder.writeCount.Load() != 1 {
+		t.Fatalf("expected one transport write, got %d", recorder.writeCount.Load())
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("coalesced first write payload mismatch")
+	}
+}
+
+func TestPlanFirstBlockMatchesNinjaLayout(t *testing.T) {
+	for _, overhead := range []int{0, 7, 255, firstBlockTarget - 1, firstBlockTarget, firstBlockTarget + 1} {
+		for range 100 {
+			paddingLength, payloadLength, err := planFirstBlock(overhead)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if overhead >= firstBlockTarget {
+				if paddingLength != 1 || payloadLength != 0 {
+					t.Fatalf("unexpected oversized plan: overhead=%d padding=%d payload=%d", overhead, paddingLength, payloadLength)
+				}
+				continue
+			}
+			if paddingLength < 1 || payloadLength < 1 || overhead+paddingLength+payloadLength != firstBlockTarget+1 {
+				t.Fatalf("unexpected plan: overhead=%d padding=%d payload=%d", overhead, paddingLength, payloadLength)
+			}
+		}
 	}
 }
 

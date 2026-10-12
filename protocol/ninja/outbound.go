@@ -1,6 +1,7 @@
 package ninja
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -194,18 +195,19 @@ type packetResult struct {
 }
 
 type oneShotPacketConn struct {
-	ctx           context.Context
-	cancel        context.CancelFunc
-	dialer        packetDialer
-	credentials   Credentials
-	destination   M.Socksaddr
-	results       chan packetResult
-	readDeadline  pipe.Deadline
-	access        sync.Mutex
-	connections   map[net.Conn]struct{}
-	localAddr     net.Addr
-	writeDeadline time.Time
-	closed        bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	dialer         packetDialer
+	credentials    Credentials
+	destination    M.Socksaddr
+	results        chan packetResult
+	readDeadline   pipe.Deadline
+	access         sync.Mutex
+	connections    map[net.Conn]struct{}
+	localAddr      net.Addr
+	readDeadlineAt time.Time
+	writeDeadline  time.Time
+	closed         bool
 }
 
 // NewClientPacketConnWithDialer creates a compatible Ninja UDP packet connection.
@@ -223,7 +225,7 @@ func NewClientPacketConnWithDialer(ctx context.Context, dialer func(context.Cont
 }
 
 func newClientOneShotPacketConn(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) net.PacketConn {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &oneShotPacketConn{
 		ctx:          ctx,
 		cancel:       cancel,
@@ -298,6 +300,14 @@ func (c *oneShotPacketConn) WriteTo(buffer []byte, address net.Addr) (int, error
 		connection.Close()
 		return 0, net.ErrClosed
 	}
+	if !c.readDeadlineAt.IsZero() {
+		if err = connection.SetReadDeadline(c.readDeadlineAt); err != nil {
+			c.access.Unlock()
+			operationCancel()
+			connection.Close()
+			return 0, err
+		}
+	}
 	c.connections[connection] = struct{}{}
 	if c.localAddr == nil {
 		c.localAddr = connection.LocalAddr()
@@ -371,16 +381,24 @@ func (c *oneShotPacketConn) LocalAddr() net.Addr {
 }
 
 func (c *oneShotPacketConn) SetDeadline(deadline time.Time) error {
-	c.readDeadline.Set(deadline)
-	c.access.Lock()
-	c.writeDeadline = deadline
-	c.access.Unlock()
-	return nil
+	if err := c.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(deadline)
 }
 
 func (c *oneShotPacketConn) SetReadDeadline(deadline time.Time) error {
 	c.readDeadline.Set(deadline)
-	return nil
+	c.access.Lock()
+	c.readDeadlineAt = deadline
+	var deadlineErr error
+	for connection := range c.connections {
+		if err := connection.SetReadDeadline(deadline); err != nil && deadlineErr == nil {
+			deadlineErr = err
+		}
+	}
+	c.access.Unlock()
+	return deadlineErr
 }
 
 func (c *oneShotPacketConn) SetWriteDeadline(deadline time.Time) error {
@@ -449,16 +467,53 @@ func (c *conn) SetReadDeadline(deadline time.Time) error {
 	return nil
 }
 
-func (c *conn) startLocked(payload []byte) error {
+func (c *conn) startLocked(payload []byte, paddingLength int) error {
 	if c.writeSession != nil {
 		return nil
 	}
 	capture := &saltCaptureWriter{Writer: c.Conn}
-	paddingLength := 0
-	if c.network == udpNetwork {
-		paddingLength = 1
-	}
 	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload, paddingLength)
+	c.handshakeOnce.Do(func() {
+		c.handshakeErr = err
+		if err == nil {
+			c.writeSession, c.clientSalt = writeSession, capture.salt
+		}
+		close(c.handshakeDone)
+	})
+	return c.handshakeErr
+}
+
+func (c *conn) startTCPWriteLocked(payload []byte) error {
+	paddingLength, initialLength, err := c.planFirstBlock()
+	if err != nil {
+		return err
+	}
+	if initialLength > len(payload) {
+		initialLength = len(payload)
+	}
+	var wire bytes.Buffer
+	capture := &saltCaptureWriter{Writer: &wire}
+	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload[:initialLength], paddingLength)
+	remaining := payload[initialLength:]
+	for err == nil && len(remaining) > 0 {
+		chunkLength := len(remaining)
+		if chunkLength > maxCorePayload {
+			chunkLength = maxCorePayload
+		}
+		var frame bytes.Buffer
+		err = writeSession.WriteFrame(&frame, remaining[:chunkLength])
+		if err == nil && wire.Len()+frame.Len() > tcpWriteBufferSize {
+			err = writeAll(c.Conn, wire.Bytes())
+			wire.Reset()
+		}
+		if err == nil {
+			_, err = wire.Write(frame.Bytes())
+		}
+		remaining = remaining[chunkLength:]
+	}
+	if err == nil {
+		err = writeAll(c.Conn, wire.Bytes())
+	}
 	c.handshakeOnce.Do(func() {
 		c.handshakeErr = err
 		if err == nil {
@@ -484,7 +539,7 @@ func (c *conn) ensureReadSession() error {
 			}
 			return c.initializeReadSession()
 		}
-		if err := c.startLocked(nil); err != nil {
+		if err := c.startTCPWriteLocked(nil); err != nil {
 			c.writeAccess.Unlock()
 			return err
 		}
@@ -564,24 +619,15 @@ func (c *conn) WriteTo(payload []byte, destination Destination) (int, error) {
 	if c.writeSession == nil {
 		if c.network == udpNetwork {
 			c.destination = destination
-			if err := c.startLocked(payload); err != nil {
+			if err := c.startLocked(payload, 1); err != nil {
 				return 0, err
 			}
 			return len(payload), nil
 		}
-		initialLimit, err := c.initialPayloadLimit()
-		if err != nil {
+		if err := c.startTCPWriteLocked(payload); err != nil {
 			return 0, err
 		}
-		if len(payload) <= initialLimit {
-			if err := c.startLocked(payload); err != nil {
-				return 0, err
-			}
-			return len(payload), nil
-		}
-		if err := c.startLocked(nil); err != nil {
-			return 0, err
-		}
+		return originalLength, nil
 	}
 	if c.network == udpNetwork {
 		if len(payload) > maxCorePayload {
@@ -608,20 +654,12 @@ func (c *conn) WriteTo(payload []byte, destination Destination) (int, error) {
 	return originalLength, nil
 }
 
-func (c *conn) initialPayloadLimit() (int, error) {
+func (c *conn) planFirstBlock() (paddingLength int, payloadLength int, err error) {
 	destination, err := encodeTransportDestination(c.destination)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	paddingLength := 0
-	if c.network == udpNetwork {
-		paddingLength = 1
-	}
-	limit := maxCorePayload
-	if handshakeLimit := 0xffff - len(destination) - 2 - paddingLength; handshakeLimit < limit {
-		limit = handshakeLimit
-	}
-	return limit, nil
+	return planFirstBlock(len(destination))
 }
 
 type saltCaptureWriter struct {
