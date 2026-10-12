@@ -2,7 +2,9 @@ package ninja
 
 import (
 	"bytes"
+	"errors"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -187,6 +189,43 @@ func TestUDPReadWaitsForInitialWrite(t *testing.T) {
 	}
 	if !bytes.Equal(result.payload, []byte("dns-response")) {
 		t.Fatalf("unexpected UDP response: %q", result.payload)
+	}
+}
+
+func TestUDPReadWaitsForInitialWriteDeadline(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	client := NewClientPacketConn(clientRaw, credentials, M.ParseSocksaddr("1.1.1.1:53"))
+
+	if err := client.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 64)
+		_, _, err := client.ReadFrom(buffer)
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("unexpected read error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("UDP read did not honor its deadline while waiting for the first write")
+	}
+
+	if err := serverRaw.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var firstByte [1]byte
+	if _, err := serverRaw.Read(firstByte[:]); err == nil {
+		t.Fatal("deadline wait sent an empty UDP handshake")
+	} else if timeoutError, loaded := err.(net.Error); !loaded || !timeoutError.Timeout() {
+		t.Fatalf("unexpected server read error: %v", err)
 	}
 }
 
