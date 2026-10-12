@@ -44,6 +44,51 @@ func TestUDPHandshakeUsesNativeNetwork(t *testing.T) {
 	}
 }
 
+func TestUDPFirstWriteIsCoalesced(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	clientRaw, serverRaw := net.Pipe()
+	defer clientRaw.Close()
+	defer serverRaw.Close()
+	recorder := &countingWriteConn{Conn: clientRaw}
+	destination := M.ParseSocksaddr("stun.example.test:3478")
+	client := NewClientPacketConn(recorder, credentials, destination)
+	payload := []byte("udp-first-payload")
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := client.WriteTo(payload, nil)
+		writeResult <- err
+	}()
+
+	_, header, decodedDestination, initialPayload, err := credentials.ReadClientHandshake(serverRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = <-writeResult; err != nil {
+		t.Fatal(err)
+	}
+	if recorder.writeCount.Load() != 1 {
+		t.Fatalf("expected one UDP transport write, got %d", recorder.writeCount.Load())
+	}
+	if header.Network != udpNetwork || decodedDestination != (Destination{Host: "stun.example.test", Port: 3478}) {
+		t.Fatalf("unexpected UDP handshake: network=%d destination=%v", header.Network, decodedDestination)
+	}
+	if !bytes.Equal(initialPayload, payload) {
+		t.Fatalf("unexpected UDP initial payload: %q", initialPayload)
+	}
+	encodedDestination, err := encodeTransportDestination(decodedDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paddingLength := int(header.FirstDataSize) - len(encodedDestination) - 2 - len(payload)
+	paddingLimit := firstBlockTarget - len(encodedDestination) - len(payload)
+	if paddingLimit > firstBlockMaxPad {
+		paddingLimit = firstBlockMaxPad
+	}
+	if paddingLength < 1 || paddingLength > paddingLimit {
+		t.Fatalf("unexpected UDP initial padding: %d (limit %d)", paddingLength, paddingLimit)
+	}
+}
+
 func TestUDPResponseStripsDestination(t *testing.T) {
 	connection := &conn{
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
@@ -493,20 +538,22 @@ func TestTCPFirstWriteIsCoalesced(t *testing.T) {
 }
 
 func TestPlanFirstBlockMatchesNinjaLayout(t *testing.T) {
-	for _, overhead := range []int{0, 7, 255, firstBlockTarget - 1, firstBlockTarget, firstBlockTarget + 1} {
-		for range 100 {
-			paddingLength, payloadLength, err := planFirstBlock(overhead)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if overhead >= firstBlockTarget {
-				if paddingLength != 1 || payloadLength != 0 {
-					t.Fatalf("unexpected oversized plan: overhead=%d padding=%d payload=%d", overhead, paddingLength, payloadLength)
+	for _, existingPayloadLength := range []int{0, 20, firstBlockTarget + 1} {
+		for _, overhead := range []int{0, 7, 255, firstBlockTarget - 1, firstBlockTarget, firstBlockTarget + 1} {
+			for range 100 {
+				paddingLength, payloadLength, err := planFirstBlock(overhead, existingPayloadLength)
+				if err != nil {
+					t.Fatal(err)
 				}
-				continue
-			}
-			if paddingLength < 1 || payloadLength < 1 || overhead+paddingLength+payloadLength != firstBlockTarget+1 {
-				t.Fatalf("unexpected plan: overhead=%d padding=%d payload=%d", overhead, paddingLength, payloadLength)
+				if overhead+existingPayloadLength >= firstBlockTarget {
+					if paddingLength != 1 || payloadLength != existingPayloadLength {
+						t.Fatalf("unexpected oversized plan: overhead=%d existing=%d padding=%d payload=%d", overhead, existingPayloadLength, paddingLength, payloadLength)
+					}
+					continue
+				}
+				if paddingLength < 1 || payloadLength < existingPayloadLength || overhead+paddingLength+payloadLength != firstBlockTarget+1 {
+					t.Fatalf("unexpected plan: overhead=%d existing=%d padding=%d payload=%d", overhead, existingPayloadLength, paddingLength, payloadLength)
+				}
 			}
 		}
 	}

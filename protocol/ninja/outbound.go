@@ -467,12 +467,24 @@ func (c *conn) SetReadDeadline(deadline time.Time) error {
 	return nil
 }
 
-func (c *conn) startLocked(payload []byte, paddingLength int) error {
+func (c *conn) startUDPWriteLocked(payload []byte) error {
 	if c.writeSession != nil {
 		return nil
 	}
-	capture := &saltCaptureWriter{Writer: c.Conn}
+	destination, err := encodeTransportDestination(c.destination)
+	if err != nil {
+		return err
+	}
+	paddingLength, _, err := planFirstBlock(len(destination), len(payload))
+	if err != nil {
+		return err
+	}
+	var wire bytes.Buffer
+	capture := &saltCaptureWriter{Writer: &wire}
 	writeSession, err := c.credentials.WriteClientHandshakeNetwork(capture, c.network, c.destination, payload, paddingLength)
+	if err == nil {
+		err = writeAll(c.Conn, wire.Bytes())
+	}
 	c.handshakeOnce.Do(func() {
 		c.handshakeErr = err
 		if err == nil {
@@ -484,7 +496,7 @@ func (c *conn) startLocked(payload []byte, paddingLength int) error {
 }
 
 func (c *conn) startTCPWriteLocked(payload []byte) error {
-	paddingLength, initialLength, err := c.planFirstBlock()
+	paddingLength, initialLength, err := c.planFirstBlock(0)
 	if err != nil {
 		return err
 	}
@@ -619,7 +631,7 @@ func (c *conn) WriteTo(payload []byte, destination Destination) (int, error) {
 	if c.writeSession == nil {
 		if c.network == udpNetwork {
 			c.destination = destination
-			if err := c.startLocked(payload, 1); err != nil {
+			if err := c.startUDPWriteLocked(payload); err != nil {
 				return 0, err
 			}
 			return len(payload), nil
@@ -654,12 +666,12 @@ func (c *conn) WriteTo(payload []byte, destination Destination) (int, error) {
 	return originalLength, nil
 }
 
-func (c *conn) planFirstBlock() (paddingLength int, payloadLength int, err error) {
+func (c *conn) planFirstBlock(existingPayloadLength int) (paddingLength int, payloadLength int, err error) {
 	destination, err := encodeTransportDestination(c.destination)
 	if err != nil {
 		return 0, 0, err
 	}
-	return planFirstBlock(len(destination))
+	return planFirstBlock(len(destination), existingPayloadLength)
 }
 
 type saltCaptureWriter struct {

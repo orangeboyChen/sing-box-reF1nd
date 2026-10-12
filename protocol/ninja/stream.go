@@ -25,13 +25,13 @@ const (
 	tcpWriteBufferSize = 0x8000
 )
 
-func planFirstBlock(overhead int) (paddingLength int, payloadLength int, err error) {
-	available := firstBlockTarget - overhead
+func planFirstBlock(overhead int, existingPayloadLength int) (paddingLength int, payloadLength int, err error) {
+	available := firstBlockTarget - overhead - existingPayloadLength
 	if available > firstBlockMaxPad {
 		available = firstBlockMaxPad
 	}
 	if available <= 0 {
-		return 1, 0, nil
+		return 1, existingPayloadLength, nil
 	}
 	value, err := rand.Int(rand.Reader, big.NewInt(int64(available)))
 	if err != nil {
@@ -39,6 +39,9 @@ func planFirstBlock(overhead int) (paddingLength int, payloadLength int, err err
 	}
 	paddingLength = int(value.Int64()) + 1
 	payloadLength = firstBlockTarget - overhead - paddingLength + 1
+	if payloadLength < existingPayloadLength {
+		payloadLength = existingPayloadLength
+	}
 	return paddingLength, payloadLength, nil
 }
 
