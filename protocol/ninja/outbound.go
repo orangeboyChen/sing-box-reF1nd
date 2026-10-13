@@ -221,7 +221,7 @@ func NewClientUDPConnWithDialer(ctx context.Context, dialer func(context.Context
 	if err != nil {
 		return nil, err
 	}
-	return bufio.NewBindPacketConn(packetConnection, destination.UDPAddr()), nil
+	return bufio.NewBindPacketConn(packetConnection, destination), nil
 }
 
 func newClientOneShotPacketConn(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) net.PacketConn {

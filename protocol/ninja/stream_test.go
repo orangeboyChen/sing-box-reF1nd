@@ -180,6 +180,9 @@ func TestUDPClientConnUsesStreamPerDNSQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	if client.RemoteAddr().String() != destination.String() {
+		t.Fatalf("connected UDP remote address lost its domain: %v", client.RemoteAddr())
+	}
 
 	payloads := [][]byte{[]byte("query-a"), []byte("query-aaaa")}
 	writeErrors := make(chan error, len(payloads))
