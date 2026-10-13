@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -113,11 +114,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		if !common.Contains(h.Network(), N.NetworkUDP) {
 			return nil, exceptions.New("Ninja UDP is not enabled")
 		}
-		connection, err := h.dialServer(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return newConn(connection, h.credentials, toDestination(destination), udpNetwork), nil
+		return NewClientUDPConnWithDialer(ctx, h.dialServer, h.credentials, destination)
 	}
 	if N.NetworkName(network) != N.NetworkTCP {
 		return nil, exceptions.Extend(N.ErrUnknownNetwork, network)
@@ -211,17 +208,20 @@ type oneShotPacketConn struct {
 }
 
 // NewClientPacketConnWithDialer creates a compatible Ninja UDP packet connection.
-// Some Ninja servers stop forwarding DNS after the first response on a
-// persistent stream, so port 53 uses one Ninja stream per query.
+// Ninja servers only reliably return the first UDP response on a stream, so
+// each packet uses its own stream.
 func NewClientPacketConnWithDialer(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) (net.PacketConn, error) {
-	if destination.Port != 53 {
-		connection, err := dialer(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return NewClientPacketConn(connection, credentials, destination), nil
-	}
 	return newClientOneShotPacketConn(ctx, dialer, credentials, destination), nil
+}
+
+// NewClientUDPConnWithDialer creates a connected view of a Ninja UDP packet
+// connection while preserving the one-stream-per-packet behavior.
+func NewClientUDPConnWithDialer(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) (net.Conn, error) {
+	packetConnection, err := NewClientPacketConnWithDialer(ctx, dialer, credentials, destination)
+	if err != nil {
+		return nil, err
+	}
+	return bufio.NewBindPacketConn(packetConnection, destination.UDPAddr()), nil
 }
 
 func newClientOneShotPacketConn(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) net.PacketConn {
@@ -573,6 +573,14 @@ func (c *conn) Read(buffer []byte) (int, error) {
 			return 0, err
 		}
 		c.buffer = payload
+	}
+	if c.network == udpNetwork {
+		_, payload, err := decodeUDPResponse(c.buffer)
+		if err != nil {
+			return 0, fmt.Errorf("decode Ninja UDP response address: %w", err)
+		}
+		c.buffer = nil
+		return copy(buffer, payload), nil
 	}
 	size := copy(buffer, c.buffer)
 	c.buffer = c.buffer[size:]

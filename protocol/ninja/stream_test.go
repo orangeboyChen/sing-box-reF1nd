@@ -149,6 +149,77 @@ func TestDNSWritePreservesBoundDomainDestination(t *testing.T) {
 	}
 }
 
+func TestUDPClientConnUsesStreamPerDNSQuery(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("dns.example.test:53")
+	var dialCount atomic.Int32
+	serverErrors := make(chan error, 2)
+	dialer := func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			_, header, decodedDestination, payload, err := credentials.ReadClientHandshake(serverRaw)
+			if err == nil && decodedDestination != (Destination{Host: "dns.example.test", Port: 53}) {
+				err = errors.New("DNS handshake did not preserve the bound domain destination")
+			}
+			var encodedDestination []byte
+			if err == nil {
+				encodedDestination, err = encodeTransportDestination(decodedDestination)
+			}
+			if err == nil {
+				response := append(encodedDestination, payload...)
+				_, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
+			}
+			serverErrors <- err
+		}()
+		return clientRaw, nil
+	}
+	client, err := NewClientUDPConnWithDialer(context.Background(), dialer, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	payloads := [][]byte{[]byte("query-a"), []byte("query-aaaa")}
+	writeErrors := make(chan error, len(payloads))
+	for _, payload := range payloads {
+		go func() {
+			count, writeErr := client.Write(payload)
+			if writeErr == nil && count != len(payload) {
+				writeErr = errors.New("unexpected write count")
+			}
+			writeErrors <- writeErr
+		}()
+	}
+	for range payloads {
+		if err = <-writeErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	responses := make(map[string]bool)
+	for range payloads {
+		buffer := make([]byte, 64)
+		count, readErr := client.Read(buffer)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		responses[string(buffer[:count])] = true
+	}
+	if !responses["query-a"] || !responses["query-aaaa"] {
+		t.Fatalf("unexpected responses: %v", responses)
+	}
+	if dialCount.Load() != int32(len(payloads)) {
+		t.Fatalf("expected one Ninja stream per DNS query, got %d streams", dialCount.Load())
+	}
+	for range payloads {
+		if err = <-serverErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestUDPResponseStripsDestination(t *testing.T) {
 	connection := &conn{
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
@@ -172,7 +243,7 @@ func TestUDPResponseStripsDestination(t *testing.T) {
 	}
 }
 
-func TestUDPStreamResponsePreservesPayload(t *testing.T) {
+func TestUDPStreamResponseStripsDestination(t *testing.T) {
 	connection := &conn{
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
 		handshakeDone: make(chan struct{}),
@@ -186,8 +257,7 @@ func TestUDPStreamResponsePreservesPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...)
-	if count != len(expected) || !bytes.Equal(buffer[:count], expected) {
+	if count != len("dns-payload") || !bytes.Equal(buffer[:count], []byte("dns-payload")) {
 		t.Fatalf("unexpected UDP stream payload: %q", buffer[:count])
 	}
 }
@@ -346,9 +416,9 @@ func TestUDPReadWaitsForInitialWriteDeadline(t *testing.T) {
 	}
 }
 
-func TestUDPClientPacketConnUsesStreamPerPacket(t *testing.T) {
+func TestUDPClientPacketConnUsesStreamPerPacketOutsideDNS(t *testing.T) {
 	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
-	destination := M.ParseSocksaddr("1.1.1.1:53")
+	destination := M.ParseSocksaddr("stun.example.test:3478")
 	var dialCount atomic.Int32
 	serverErrors := make(chan error, 2)
 	dialer := func(context.Context) (net.Conn, error) {
@@ -361,7 +431,12 @@ func TestUDPClientPacketConnUsesStreamPerPacket(t *testing.T) {
 				serverErrors <- err
 				return
 			}
-			response := append([]byte{1, 1, 1, 1, 1, 0, 53}, payload...)
+			encodedDestination, encodeErr := encodeTransportDestination(toDestination(destination))
+			if encodeErr != nil {
+				serverErrors <- encodeErr
+				return
+			}
+			response := append(encodedDestination, payload...)
 			_, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
 			serverErrors <- err
 		}()
@@ -495,27 +570,6 @@ func TestUDPClientPacketConnReadDeadlineClosesStream(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("deadline did not close the one-shot stream")
-	}
-}
-
-func TestUDPClientPacketConnKeepsPersistentStreamOutsideDNS(t *testing.T) {
-	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
-	clientRaw, serverRaw := net.Pipe()
-	defer serverRaw.Close()
-	var dialCount atomic.Int32
-	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
-		dialCount.Add(1)
-		return clientRaw, nil
-	}, credentials, M.ParseSocksaddr("1.1.1.1:443"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	if _, loaded := client.(*packetConn); !loaded {
-		t.Fatal("non-DNS UDP did not keep the persistent Ninja packet connection")
-	}
-	if dialCount.Load() != 1 {
-		t.Fatalf("expected one persistent Ninja stream, got %d", dialCount.Load())
 	}
 }
 
