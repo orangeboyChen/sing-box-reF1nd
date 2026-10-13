@@ -351,16 +351,16 @@ func (c *oneShotPacketConn) readOnePacket(operationCtx context.Context, operatio
 	if operationCtx.Err() != nil {
 		return
 	}
-	if err != nil && exceptions.IsTimeout(err) {
+	if err != nil {
+		// Each transport connection carries one UDP packet. Treat a child
+		// stream failure as packet loss instead of closing the association.
 		return
 	}
-	result := packetResult{destination: c.destination, err: err}
-	if err == nil {
-		var responseDestination Destination
-		responseDestination, result.payload, result.err = decodeUDPResponse(payload)
-		if result.err == nil {
-			result.destination = M.ParseSocksaddrHostPort(responseDestination.Host, responseDestination.Port)
-		}
+	result := packetResult{destination: c.destination}
+	var responseDestination Destination
+	responseDestination, result.payload, result.err = decodeUDPResponse(payload)
+	if result.err == nil {
+		result.destination = M.ParseSocksaddrHostPort(responseDestination.Host, responseDestination.Port)
 	}
 	select {
 	case c.results <- result:
