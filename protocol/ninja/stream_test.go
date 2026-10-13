@@ -38,6 +38,16 @@ func (c *delayedTimeoutConn) Read(payload []byte) (int, error) {
 	return count, err
 }
 
+type rejectingReadDeadlineConn struct {
+	net.Conn
+	calls *atomic.Int32
+}
+
+func (c *rejectingReadDeadlineConn) SetReadDeadline(time.Time) error {
+	c.calls.Add(1)
+	return errors.New("read deadline unsupported")
+}
+
 func TestRejectsDestinationWithoutPort(t *testing.T) {
 	if _, err := encodeTransportDestination(Destination{Host: "example.test"}); err == nil {
 		t.Fatal("regular destination without port was accepted")
@@ -690,6 +700,134 @@ func TestUDPClientPacketConnDoesNotQueueStaleTimeout(t *testing.T) {
 		if err = <-serverErrors; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestUDPClientPacketConnReapsUnansweredStream(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("telemetry.example.test:9999")
+	serverClosed := make(chan error, 1)
+	var readDeadlineCalls atomic.Int32
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		go func() {
+			defer serverRaw.Close()
+			if _, _, _, _, readErr := credentials.ReadClientHandshake(serverRaw); readErr != nil {
+				serverClosed <- readErr
+				return
+			}
+			var buffer [1]byte
+			_, readErr := serverRaw.Read(buffer[:])
+			serverClosed <- readErr
+		}()
+		return &rejectingReadDeadlineConn{Conn: clientRaw, calls: &readDeadlineCalls}, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	oneShotClient := client.(*oneShotPacketConn)
+	oneShotClient.responseTimeout = 50 * time.Millisecond
+
+	if _, err = client.WriteTo([]byte("one-way"), destination); err != nil {
+		t.Fatal(err)
+	}
+	if callCount := readDeadlineCalls.Load(); callCount != 0 {
+		t.Fatalf("fallback lifetime called unsupported SetReadDeadline %d time(s)", callCount)
+	}
+	select {
+	case err = <-serverClosed:
+		if err == nil {
+			t.Fatal("unanswered stream remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unanswered stream was not reaped")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		oneShotClient.access.Lock()
+		connectionCount := len(oneShotClient.connections)
+		oneShotClient.access.Unlock()
+		if connectionCount == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unanswered stream remained tracked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if resultCount := len(oneShotClient.results); resultCount != 0 {
+		t.Fatalf("unanswered stream queued %d timeout result(s)", resultCount)
+	}
+	if slotCount := len(oneShotClient.streamSlots); slotCount != 0 {
+		t.Fatalf("unanswered stream retained %d slot(s)", slotCount)
+	}
+}
+
+func TestUDPClientPacketConnBackpressuresAtInFlightLimit(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("telemetry.example.test:9999")
+	serverClosed := make(chan error, 2)
+	var dialCount atomic.Int32
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			if _, _, _, _, readErr := credentials.ReadClientHandshake(serverRaw); readErr != nil {
+				serverClosed <- readErr
+				return
+			}
+			var buffer [1]byte
+			_, readErr := serverRaw.Read(buffer[:])
+			serverClosed <- readErr
+		}()
+		return clientRaw, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	oneShotClient := client.(*oneShotPacketConn)
+	oneShotClient.responseTimeout = 75 * time.Millisecond
+	oneShotClient.streamSlots = make(chan struct{}, 1)
+
+	if _, err = client.WriteTo([]byte("first"), destination); err != nil {
+		t.Fatal(err)
+	}
+	if err = client.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.WriteTo([]byte("blocked"), destination); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unexpected backpressure error: %v", err)
+	}
+	if count := dialCount.Load(); count != 1 {
+		t.Fatalf("backpressured write opened %d streams", count)
+	}
+	if err = client.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-serverClosed:
+		if err == nil {
+			t.Fatal("first unanswered stream remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first unanswered stream was not reaped")
+	}
+	if _, err = client.WriteTo([]byte("after-reap"), destination); err != nil {
+		t.Fatal(err)
+	}
+	if count := dialCount.Load(); count != 2 {
+		t.Fatalf("write after reap opened %d streams", count)
+	}
+	select {
+	case err = <-serverClosed:
+		if err == nil {
+			t.Fatal("second unanswered stream remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second unanswered stream was not reaped")
 	}
 }
 
