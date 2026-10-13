@@ -23,6 +23,31 @@ func (c *countingWriteConn) Write(payload []byte) (int, error) {
 	return c.Conn.Write(payload)
 }
 
+type delayedTimeoutConn struct {
+	net.Conn
+	release  <-chan struct{}
+	returned chan<- struct{}
+}
+
+func (c *delayedTimeoutConn) Read(payload []byte) (int, error) {
+	count, err := c.Conn.Read(payload)
+	if timeoutError, loaded := err.(net.Error); loaded && timeoutError.Timeout() {
+		<-c.release
+		close(c.returned)
+	}
+	return count, err
+}
+
+type rejectingReadDeadlineConn struct {
+	net.Conn
+	calls *atomic.Int32
+}
+
+func (c *rejectingReadDeadlineConn) SetReadDeadline(time.Time) error {
+	c.calls.Add(1)
+	return errors.New("read deadline unsupported")
+}
+
 func TestRejectsDestinationWithoutPort(t *testing.T) {
 	if _, err := encodeTransportDestination(Destination{Host: "example.test"}); err == nil {
 		t.Fatal("regular destination without port was accepted")
@@ -149,6 +174,80 @@ func TestDNSWritePreservesBoundDomainDestination(t *testing.T) {
 	}
 }
 
+func TestUDPClientConnUsesStreamPerDNSQuery(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("dns.example.test:53")
+	var dialCount atomic.Int32
+	serverErrors := make(chan error, 2)
+	dialer := func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			_, header, decodedDestination, payload, err := credentials.ReadClientHandshake(serverRaw)
+			if err == nil && decodedDestination != (Destination{Host: "dns.example.test", Port: 53}) {
+				err = errors.New("DNS handshake did not preserve the bound domain destination")
+			}
+			var encodedDestination []byte
+			if err == nil {
+				encodedDestination, err = encodeTransportDestination(decodedDestination)
+			}
+			if err == nil {
+				response := append(encodedDestination, payload...)
+				_, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
+			}
+			serverErrors <- err
+		}()
+		return clientRaw, nil
+	}
+	client, err := NewClientUDPConnWithDialer(context.Background(), dialer, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if client.RemoteAddr().String() != destination.String() {
+		t.Fatalf("connected UDP remote address lost its domain: %v", client.RemoteAddr())
+	}
+
+	payloads := [][]byte{[]byte("query-a"), []byte("query-aaaa")}
+	writeErrors := make(chan error, len(payloads))
+	for _, payload := range payloads {
+		go func() {
+			count, writeErr := client.Write(payload)
+			if writeErr == nil && count != len(payload) {
+				writeErr = errors.New("unexpected write count")
+			}
+			writeErrors <- writeErr
+		}()
+	}
+	for range payloads {
+		if err = <-writeErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	responses := make(map[string]bool)
+	for range payloads {
+		buffer := make([]byte, 64)
+		count, readErr := client.Read(buffer)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		responses[string(buffer[:count])] = true
+	}
+	if !responses["query-a"] || !responses["query-aaaa"] {
+		t.Fatalf("unexpected responses: %v", responses)
+	}
+	if dialCount.Load() != int32(len(payloads)) {
+		t.Fatalf("expected one Ninja stream per DNS query, got %d streams", dialCount.Load())
+	}
+	for range payloads {
+		if err = <-serverErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestUDPResponseStripsDestination(t *testing.T) {
 	connection := &conn{
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
@@ -172,7 +271,7 @@ func TestUDPResponseStripsDestination(t *testing.T) {
 	}
 }
 
-func TestUDPStreamResponsePreservesPayload(t *testing.T) {
+func TestUDPStreamResponseStripsDestination(t *testing.T) {
 	connection := &conn{
 		buffer:        append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...),
 		handshakeDone: make(chan struct{}),
@@ -186,8 +285,7 @@ func TestUDPStreamResponsePreservesPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := append([]byte{1, 1, 1, 1, 1, 0, 53}, []byte("dns-payload")...)
-	if count != len(expected) || !bytes.Equal(buffer[:count], expected) {
+	if count != len("dns-payload") || !bytes.Equal(buffer[:count], []byte("dns-payload")) {
 		t.Fatalf("unexpected UDP stream payload: %q", buffer[:count])
 	}
 }
@@ -346,9 +444,9 @@ func TestUDPReadWaitsForInitialWriteDeadline(t *testing.T) {
 	}
 }
 
-func TestUDPClientPacketConnUsesStreamPerPacket(t *testing.T) {
+func TestUDPClientPacketConnUsesStreamPerPacketOutsideDNS(t *testing.T) {
 	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
-	destination := M.ParseSocksaddr("1.1.1.1:53")
+	destination := M.ParseSocksaddr("stun.example.test:3478")
 	var dialCount atomic.Int32
 	serverErrors := make(chan error, 2)
 	dialer := func(context.Context) (net.Conn, error) {
@@ -361,7 +459,12 @@ func TestUDPClientPacketConnUsesStreamPerPacket(t *testing.T) {
 				serverErrors <- err
 				return
 			}
-			response := append([]byte{1, 1, 1, 1, 1, 0, 53}, payload...)
+			encodedDestination, encodeErr := encodeTransportDestination(toDestination(destination))
+			if encodeErr != nil {
+				serverErrors <- encodeErr
+				return
+			}
+			response := append(encodedDestination, payload...)
 			_, err = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
 			serverErrors <- err
 		}()
@@ -498,24 +601,317 @@ func TestUDPClientPacketConnReadDeadlineClosesStream(t *testing.T) {
 	}
 }
 
-func TestUDPClientPacketConnKeepsPersistentStreamOutsideDNS(t *testing.T) {
+func TestUDPClientPacketConnDoesNotQueueStaleTimeout(t *testing.T) {
 	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
-	clientRaw, serverRaw := net.Pipe()
-	defer serverRaw.Close()
+	destination := M.ParseSocksaddr("stun.example.test:3478")
+	firstTimeoutRelease := make(chan struct{})
+	firstTimeoutReturned := make(chan struct{})
+	secondResponseRelease := make(chan struct{})
+	serverErrors := make(chan error, 2)
 	var dialCount atomic.Int32
 	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
-		dialCount.Add(1)
+		clientRaw, serverRaw := net.Pipe()
+		dialIndex := dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			_, header, decodedDestination, payload, readErr := credentials.ReadClientHandshake(serverRaw)
+			if readErr == nil && decodedDestination != toDestination(destination) {
+				readErr = errors.New("unexpected UDP destination")
+			}
+			if dialIndex == 1 {
+				serverErrors <- readErr
+				if readErr == nil {
+					var buffer [1]byte
+					_, _ = serverRaw.Read(buffer[:])
+				}
+				return
+			}
+			if readErr == nil {
+				<-secondResponseRelease
+				var encodedDestination []byte
+				encodedDestination, readErr = encodeTransportDestination(decodedDestination)
+				if readErr == nil {
+					response := append(encodedDestination, payload...)
+					_, readErr = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
+				}
+			}
+			serverErrors <- readErr
+		}()
+		if dialIndex == 1 {
+			return &delayedTimeoutConn{Conn: clientRaw, release: firstTimeoutRelease, returned: firstTimeoutReturned}, nil
+		}
 		return clientRaw, nil
-	}, credentials, M.ParseSocksaddr("1.1.1.1:443"))
+	}, credentials, destination)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if _, loaded := client.(*packetConn); !loaded {
-		t.Fatal("non-DNS UDP did not keep the persistent Ninja packet connection")
+	oneShotClient := client.(*oneShotPacketConn)
+
+	if err = client.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
 	}
-	if dialCount.Load() != 1 {
-		t.Fatalf("expected one persistent Ninja stream, got %d", dialCount.Load())
+	if _, err = client.WriteTo([]byte("first"), destination); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 64)
+	if _, _, err = client.ReadFrom(buffer); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("unexpected first read error: %v", err)
+	}
+
+	if err = client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.WriteTo([]byte("second"), destination); err != nil {
+		t.Fatal(err)
+	}
+	close(firstTimeoutRelease)
+	select {
+	case <-firstTimeoutReturned:
+	case <-time.After(time.Second):
+		t.Fatal("first stream did not return its delayed timeout")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		oneShotClient.access.Lock()
+		connectionCount := len(oneShotClient.connections)
+		oneShotClient.access.Unlock()
+		if connectionCount == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expired stream was not removed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if resultCount := len(oneShotClient.results); resultCount != 0 {
+		t.Fatalf("expired stream queued %d stale result(s)", resultCount)
+	}
+
+	close(secondResponseRelease)
+	count, _, err := client.ReadFrom(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer[:count], []byte("second")) {
+		t.Fatalf("unexpected retry response: %q", buffer[:count])
+	}
+	for range 2 {
+		if err = <-serverErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUDPClientPacketConnIgnoresChildEOF(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("stun.example.test:3478")
+	firstStreamClosed := make(chan struct{})
+	serverErrors := make(chan error, 2)
+	var dialCount atomic.Int32
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		dialIndex := dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			_, header, decodedDestination, payload, readErr := credentials.ReadClientHandshake(serverRaw)
+			if readErr == nil && decodedDestination != toDestination(destination) {
+				readErr = errors.New("unexpected UDP destination")
+			}
+			if dialIndex == 1 {
+				serverErrors <- readErr
+				close(firstStreamClosed)
+				return
+			}
+			if readErr == nil {
+				var encodedDestination []byte
+				encodedDestination, readErr = encodeTransportDestination(decodedDestination)
+				if readErr == nil {
+					response := append(encodedDestination, payload...)
+					_, readErr = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
+				}
+			}
+			serverErrors <- readErr
+		}()
+		return clientRaw, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	oneShotClient := client.(*oneShotPacketConn)
+
+	if _, err = client.WriteTo([]byte("first"), destination); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstStreamClosed:
+	case <-time.After(time.Second):
+		t.Fatal("first stream did not close")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		oneShotClient.access.Lock()
+		connectionCount := len(oneShotClient.connections)
+		oneShotClient.access.Unlock()
+		if connectionCount == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("closed child stream remained tracked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if resultCount := len(oneShotClient.results); resultCount != 0 {
+		t.Fatalf("child EOF queued %d association result(s)", resultCount)
+	}
+
+	if _, err = client.WriteTo([]byte("second"), destination); err != nil {
+		t.Fatal(err)
+	}
+	if err = client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 64)
+	count, _, err := client.ReadFrom(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer[:count], []byte("second")) {
+		t.Fatalf("unexpected retry response: %q", buffer[:count])
+	}
+	for range 2 {
+		if err = <-serverErrors; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUDPClientPacketConnReapsUnansweredStream(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("telemetry.example.test:9999")
+	serverClosed := make(chan error, 1)
+	var readDeadlineCalls atomic.Int32
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		go func() {
+			defer serverRaw.Close()
+			if _, _, _, _, readErr := credentials.ReadClientHandshake(serverRaw); readErr != nil {
+				serverClosed <- readErr
+				return
+			}
+			var buffer [1]byte
+			_, readErr := serverRaw.Read(buffer[:])
+			serverClosed <- readErr
+		}()
+		return &rejectingReadDeadlineConn{Conn: clientRaw, calls: &readDeadlineCalls}, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	oneShotClient := client.(*oneShotPacketConn)
+	oneShotClient.responseTimeout = 50 * time.Millisecond
+
+	if _, err = client.WriteTo([]byte("one-way"), destination); err != nil {
+		t.Fatal(err)
+	}
+	if callCount := readDeadlineCalls.Load(); callCount != 0 {
+		t.Fatalf("fallback lifetime called unsupported SetReadDeadline %d time(s)", callCount)
+	}
+	select {
+	case err = <-serverClosed:
+		if err == nil {
+			t.Fatal("unanswered stream remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unanswered stream was not reaped")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		oneShotClient.access.Lock()
+		connectionCount := len(oneShotClient.connections)
+		oneShotClient.access.Unlock()
+		if connectionCount == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unanswered stream remained tracked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if resultCount := len(oneShotClient.results); resultCount != 0 {
+		t.Fatalf("unanswered stream queued %d timeout result(s)", resultCount)
+	}
+	if slotCount := len(oneShotClient.streamSlots); slotCount != 0 {
+		t.Fatalf("unanswered stream retained %d slot(s)", slotCount)
+	}
+}
+
+func TestUDPClientPacketConnBackpressuresAtInFlightLimit(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("telemetry.example.test:9999")
+	serverClosed := make(chan error, 2)
+	var dialCount atomic.Int32
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			if _, _, _, _, readErr := credentials.ReadClientHandshake(serverRaw); readErr != nil {
+				serverClosed <- readErr
+				return
+			}
+			var buffer [1]byte
+			_, readErr := serverRaw.Read(buffer[:])
+			serverClosed <- readErr
+		}()
+		return clientRaw, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	oneShotClient := client.(*oneShotPacketConn)
+	oneShotClient.responseTimeout = 75 * time.Millisecond
+	oneShotClient.streamSlots = make(chan struct{}, 1)
+
+	if _, err = client.WriteTo([]byte("first"), destination); err != nil {
+		t.Fatal(err)
+	}
+	if err = client.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.WriteTo([]byte("blocked"), destination); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unexpected backpressure error: %v", err)
+	}
+	if count := dialCount.Load(); count != 1 {
+		t.Fatalf("backpressured write opened %d streams", count)
+	}
+	if err = client.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-serverClosed:
+		if err == nil {
+			t.Fatal("first unanswered stream remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first unanswered stream was not reaped")
+	}
+	if _, err = client.WriteTo([]byte("after-reap"), destination); err != nil {
+		t.Fatal(err)
+	}
+	if count := dialCount.Load(); count != 2 {
+		t.Fatalf("write after reap opened %d streams", count)
+	}
+	select {
+	case err = <-serverClosed:
+		if err == nil {
+			t.Fatal("second unanswered stream remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second unanswered stream was not reaped")
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -26,7 +27,11 @@ import (
 	"github.com/sagernet/sing/common/pipe"
 )
 
-const websocketALPN = "cs-gw1"
+const (
+	websocketALPN                   = "cs-gw1"
+	oneShotUDPResponseTimeout       = 30 * time.Second
+	oneShotUDPMaxInFlight     int32 = 64
+)
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.NinjaOutboundOptions](registry, C.TypeNinja, NewOutbound)
@@ -113,11 +118,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		if !common.Contains(h.Network(), N.NetworkUDP) {
 			return nil, exceptions.New("Ninja UDP is not enabled")
 		}
-		connection, err := h.dialServer(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return newConn(connection, h.credentials, toDestination(destination), udpNetwork), nil
+		return NewClientUDPConnWithDialer(ctx, h.dialServer, h.credentials, destination)
 	}
 	if N.NetworkName(network) != N.NetworkTCP {
 		return nil, exceptions.Extend(N.ErrUnknownNetwork, network)
@@ -194,47 +195,59 @@ type packetResult struct {
 	err         error
 }
 
+type oneShotPacketStream struct {
+	cancel context.CancelFunc
+	timer  *time.Timer
+}
+
 type oneShotPacketConn struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	dialer         packetDialer
-	credentials    Credentials
-	destination    M.Socksaddr
-	results        chan packetResult
-	readDeadline   pipe.Deadline
-	access         sync.Mutex
-	connections    map[net.Conn]struct{}
-	localAddr      net.Addr
-	readDeadlineAt time.Time
-	writeDeadline  time.Time
-	closed         bool
+	ctx             context.Context
+	cancel          context.CancelFunc
+	dialer          packetDialer
+	credentials     Credentials
+	destination     M.Socksaddr
+	results         chan packetResult
+	readDeadline    pipe.Deadline
+	access          sync.Mutex
+	connections     map[net.Conn]*oneShotPacketStream
+	streamSlots     chan struct{}
+	responseTimeout time.Duration
+	localAddr       net.Addr
+	readDeadlineAt  time.Time
+	writeDeadline   time.Time
+	closed          bool
 }
 
 // NewClientPacketConnWithDialer creates a compatible Ninja UDP packet connection.
-// Some Ninja servers stop forwarding DNS after the first response on a
-// persistent stream, so port 53 uses one Ninja stream per query.
+// Ninja servers only reliably return the first UDP response on a stream, so
+// each packet uses its own stream.
 func NewClientPacketConnWithDialer(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) (net.PacketConn, error) {
-	if destination.Port != 53 {
-		connection, err := dialer(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return NewClientPacketConn(connection, credentials, destination), nil
-	}
 	return newClientOneShotPacketConn(ctx, dialer, credentials, destination), nil
+}
+
+// NewClientUDPConnWithDialer creates a connected view of a Ninja UDP packet
+// connection while preserving the one-stream-per-packet behavior.
+func NewClientUDPConnWithDialer(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) (net.Conn, error) {
+	packetConnection, err := NewClientPacketConnWithDialer(ctx, dialer, credentials, destination)
+	if err != nil {
+		return nil, err
+	}
+	return bufio.NewBindPacketConn(packetConnection, destination), nil
 }
 
 func newClientOneShotPacketConn(ctx context.Context, dialer func(context.Context) (net.Conn, error), credentials Credentials, destination M.Socksaddr) net.PacketConn {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &oneShotPacketConn{
-		ctx:          ctx,
-		cancel:       cancel,
-		dialer:       dialer,
-		credentials:  credentials,
-		destination:  destination,
-		results:      make(chan packetResult, 64),
-		readDeadline: pipe.MakeDeadline(),
-		connections:  make(map[net.Conn]struct{}),
+		ctx:             ctx,
+		cancel:          cancel,
+		dialer:          dialer,
+		credentials:     credentials,
+		destination:     destination,
+		results:         make(chan packetResult, 64),
+		readDeadline:    pipe.MakeDeadline(),
+		connections:     make(map[net.Conn]*oneShotPacketStream),
+		streamSlots:     make(chan struct{}, oneShotUDPMaxInFlight),
+		responseTimeout: oneShotUDPResponseTimeout,
 	}
 }
 
@@ -268,14 +281,23 @@ func (c *oneShotPacketConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
 	if !writeDeadline.IsZero() {
 		dialCtx, dialCancel = context.WithDeadline(operationCtx, writeDeadline)
 	}
+	select {
+	case c.streamSlots <- struct{}{}:
+	case <-dialCtx.Done():
+		dialCancel()
+		operationCancel()
+		return 0, dialCtx.Err()
+	}
 	connection, err := c.dialer(dialCtx)
 	dialCancel()
 	if err != nil {
+		<-c.streamSlots
 		operationCancel()
 		return 0, err
 	}
 	if !writeDeadline.IsZero() {
 		if err = connection.SetWriteDeadline(writeDeadline); err != nil {
+			<-c.streamSlots
 			operationCancel()
 			connection.Close()
 			return 0, err
@@ -285,6 +307,7 @@ func (c *oneShotPacketConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
 	c.access.Lock()
 	if c.closed {
 		c.access.Unlock()
+		<-c.streamSlots
 		operationCancel()
 		connection.Close()
 		return 0, net.ErrClosed
@@ -292,12 +315,17 @@ func (c *oneShotPacketConn) WriteTo(buffer []byte, _ net.Addr) (int, error) {
 	if !c.readDeadlineAt.IsZero() {
 		if err = connection.SetReadDeadline(c.readDeadlineAt); err != nil {
 			c.access.Unlock()
+			<-c.streamSlots
 			operationCancel()
 			connection.Close()
 			return 0, err
 		}
 	}
-	c.connections[connection] = struct{}{}
+	stream := &oneShotPacketStream{cancel: operationCancel}
+	stream.timer = time.AfterFunc(c.responseTimeout, func() {
+		c.expireConnection(connection, stream)
+	})
+	c.connections[connection] = stream
 	if c.localAddr == nil {
 		c.localAddr = connection.LocalAddr()
 	}
@@ -320,13 +348,19 @@ func (c *oneShotPacketConn) readOnePacket(operationCtx context.Context, operatio
 	defer connection.Close()
 	defer c.removeConnection(connection)
 	payload, err := ninjaConn.readPacket()
-	result := packetResult{destination: c.destination, err: err}
-	if err == nil {
-		var responseDestination Destination
-		responseDestination, result.payload, result.err = decodeUDPResponse(payload)
-		if result.err == nil {
-			result.destination = M.ParseSocksaddrHostPort(responseDestination.Host, responseDestination.Port)
-		}
+	if operationCtx.Err() != nil {
+		return
+	}
+	if err != nil {
+		// Each transport connection carries one UDP packet. Treat a child
+		// stream failure as packet loss instead of closing the association.
+		return
+	}
+	result := packetResult{destination: c.destination}
+	var responseDestination Destination
+	responseDestination, result.payload, result.err = decodeUDPResponse(payload)
+	if result.err == nil {
+		result.destination = M.ParseSocksaddrHostPort(responseDestination.Host, responseDestination.Port)
 	}
 	select {
 	case c.results <- result:
@@ -337,8 +371,31 @@ func (c *oneShotPacketConn) readOnePacket(operationCtx context.Context, operatio
 
 func (c *oneShotPacketConn) removeConnection(connection net.Conn) {
 	c.access.Lock()
-	delete(c.connections, connection)
+	stream, loaded := c.connections[connection]
+	if loaded {
+		delete(c.connections, connection)
+	}
 	c.access.Unlock()
+	if loaded {
+		stream.timer.Stop()
+		<-c.streamSlots
+	}
+}
+
+func (c *oneShotPacketConn) expireConnection(connection net.Conn, stream *oneShotPacketStream) {
+	c.access.Lock()
+	currentStream, loaded := c.connections[connection]
+	if loaded && currentStream == stream {
+		delete(c.connections, connection)
+	} else {
+		loaded = false
+	}
+	c.access.Unlock()
+	if loaded {
+		stream.cancel()
+		connection.Close()
+		<-c.streamSlots
+	}
 }
 
 func (c *oneShotPacketConn) Close() error {
@@ -349,13 +406,21 @@ func (c *oneShotPacketConn) Close() error {
 	}
 	c.closed = true
 	c.cancel()
-	connections := make([]net.Conn, 0, len(c.connections))
-	for connection := range c.connections {
-		connections = append(connections, connection)
+	type trackedConnection struct {
+		connection net.Conn
+		stream     *oneShotPacketStream
+	}
+	connections := make([]trackedConnection, 0, len(c.connections))
+	for connection, stream := range c.connections {
+		connections = append(connections, trackedConnection{connection, stream})
+		delete(c.connections, connection)
 	}
 	c.access.Unlock()
-	for _, connection := range connections {
-		connection.Close()
+	for _, tracked := range connections {
+		tracked.stream.timer.Stop()
+		tracked.stream.cancel()
+		tracked.connection.Close()
+		<-c.streamSlots
 	}
 	return nil
 }
@@ -573,6 +638,14 @@ func (c *conn) Read(buffer []byte) (int, error) {
 			return 0, err
 		}
 		c.buffer = payload
+	}
+	if c.network == udpNetwork {
+		_, payload, err := decodeUDPResponse(c.buffer)
+		if err != nil {
+			return 0, fmt.Errorf("decode Ninja UDP response address: %w", err)
+		}
+		c.buffer = nil
+		return copy(buffer, payload), nil
 	}
 	size := copy(buffer, c.buffer)
 	c.buffer = c.buffer[size:]

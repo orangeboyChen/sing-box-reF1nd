@@ -169,22 +169,10 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "outbound UDP packet connection to ", destination)
-	dialPacketStream := func(ctx context.Context) (net.Conn, error) {
-		connection, err := h.transport.DialContext(ctx)
-		if err != nil {
-			return nil, err
-		}
-		wrapper, err := NewPassConn(connection, h.passMethod, h.passPassword, h.paddingMode, h.paddingMin, h.paddingMax)
-		if err != nil {
-			connection.Close()
-			return nil, err
-		}
-		return wrapper, nil
-	}
 	credentials := ninja.Credentials{
 		Method: h.coreMethod, Password: h.corePassword, NodePassword: h.nodePassword,
 	}
-	return ninja.NewClientPacketConnWithDialer(ctx, dialPacketStream, credentials, destination)
+	return ninja.NewClientPacketConnWithDialer(ctx, (*ninjaV2Dialer)(h).dialServer, credentials, destination)
 }
 
 func (h *Outbound) Close() error {
@@ -193,11 +181,7 @@ func (h *Outbound) Close() error {
 
 type ninjaV2Dialer Outbound
 
-func (h *ninjaV2Dialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	networkName := N.NetworkName(network)
-	if networkName != N.NetworkTCP && networkName != N.NetworkUDP {
-		return nil, E.Extend(N.ErrUnknownNetwork, network)
-	}
+func (h *ninjaV2Dialer) dialServer(ctx context.Context) (net.Conn, error) {
 	connection, err := h.transport.DialContext(ctx)
 	if err != nil {
 		return nil, err
@@ -207,11 +191,23 @@ func (h *ninjaV2Dialer) DialContext(ctx context.Context, network string, destina
 		connection.Close()
 		return nil, err
 	}
+	return wrapper, nil
+}
+
+func (h *ninjaV2Dialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	networkName := N.NetworkName(network)
+	if networkName != N.NetworkTCP && networkName != N.NetworkUDP {
+		return nil, E.Extend(N.ErrUnknownNetwork, network)
+	}
 	credentials := ninja.Credentials{
 		Method: h.coreMethod, Password: h.corePassword, NodePassword: h.nodePassword,
 	}
 	if networkName == N.NetworkUDP {
-		return ninja.NewClientConnNetwork(wrapper, credentials, toNinjaDestination(destination), 2), nil
+		return ninja.NewClientUDPConnWithDialer(ctx, h.dialServer, credentials, destination)
+	}
+	wrapper, err := h.dialServer(ctx)
+	if err != nil {
+		return nil, err
 	}
 	return ninja.NewClientConn(wrapper, credentials, toNinjaDestination(destination)), nil
 }
