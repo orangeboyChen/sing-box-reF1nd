@@ -320,6 +320,9 @@ func (c *oneShotPacketConn) readOnePacket(operationCtx context.Context, operatio
 	defer connection.Close()
 	defer c.removeConnection(connection)
 	payload, err := ninjaConn.readPacket()
+	if err != nil && exceptions.IsTimeout(err) {
+		return
+	}
 	result := packetResult{destination: c.destination, err: err}
 	if err == nil {
 		var responseDestination Destination

@@ -23,6 +23,21 @@ func (c *countingWriteConn) Write(payload []byte) (int, error) {
 	return c.Conn.Write(payload)
 }
 
+type delayedTimeoutConn struct {
+	net.Conn
+	release  <-chan struct{}
+	returned chan<- struct{}
+}
+
+func (c *delayedTimeoutConn) Read(payload []byte) (int, error) {
+	count, err := c.Conn.Read(payload)
+	if timeoutError, loaded := err.(net.Error); loaded && timeoutError.Timeout() {
+		<-c.release
+		close(c.returned)
+	}
+	return count, err
+}
+
 func TestRejectsDestinationWithoutPort(t *testing.T) {
 	if _, err := encodeTransportDestination(Destination{Host: "example.test"}); err == nil {
 		t.Fatal("regular destination without port was accepted")
@@ -573,6 +588,108 @@ func TestUDPClientPacketConnReadDeadlineClosesStream(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("deadline did not close the one-shot stream")
+	}
+}
+
+func TestUDPClientPacketConnDoesNotQueueStaleTimeout(t *testing.T) {
+	credentials := Credentials{Method: AES128GCM, Password: "password", NodePassword: "node-password"}
+	destination := M.ParseSocksaddr("stun.example.test:3478")
+	firstTimeoutRelease := make(chan struct{})
+	firstTimeoutReturned := make(chan struct{})
+	secondResponseRelease := make(chan struct{})
+	serverErrors := make(chan error, 2)
+	var dialCount atomic.Int32
+	client, err := NewClientPacketConnWithDialer(context.Background(), func(context.Context) (net.Conn, error) {
+		clientRaw, serverRaw := net.Pipe()
+		dialIndex := dialCount.Add(1)
+		go func() {
+			defer serverRaw.Close()
+			_, header, decodedDestination, payload, readErr := credentials.ReadClientHandshake(serverRaw)
+			if readErr == nil && decodedDestination != toDestination(destination) {
+				readErr = errors.New("unexpected UDP destination")
+			}
+			if dialIndex == 1 {
+				serverErrors <- readErr
+				if readErr == nil {
+					var buffer [1]byte
+					_, _ = serverRaw.Read(buffer[:])
+				}
+				return
+			}
+			if readErr == nil {
+				<-secondResponseRelease
+				var encodedDestination []byte
+				encodedDestination, readErr = encodeTransportDestination(decodedDestination)
+				if readErr == nil {
+					response := append(encodedDestination, payload...)
+					_, readErr = credentials.WriteServerResponse(serverRaw, ServerResponse{ClientSalt: header.ClientSalt, Payload: response})
+				}
+			}
+			serverErrors <- readErr
+		}()
+		if dialIndex == 1 {
+			return &delayedTimeoutConn{Conn: clientRaw, release: firstTimeoutRelease, returned: firstTimeoutReturned}, nil
+		}
+		return clientRaw, nil
+	}, credentials, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	oneShotClient := client.(*oneShotPacketConn)
+
+	if err = client.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.WriteTo([]byte("first"), destination); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 64)
+	if _, _, err = client.ReadFrom(buffer); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("unexpected first read error: %v", err)
+	}
+
+	if err = client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.WriteTo([]byte("second"), destination); err != nil {
+		t.Fatal(err)
+	}
+	close(firstTimeoutRelease)
+	select {
+	case <-firstTimeoutReturned:
+	case <-time.After(time.Second):
+		t.Fatal("first stream did not return its delayed timeout")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		oneShotClient.access.Lock()
+		connectionCount := len(oneShotClient.connections)
+		oneShotClient.access.Unlock()
+		if connectionCount == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expired stream was not removed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if resultCount := len(oneShotClient.results); resultCount != 0 {
+		t.Fatalf("expired stream queued %d stale result(s)", resultCount)
+	}
+
+	close(secondResponseRelease)
+	count, _, err := client.ReadFrom(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer[:count], []byte("second")) {
+		t.Fatalf("unexpected retry response: %q", buffer[:count])
+	}
+	for range 2 {
+		if err = <-serverErrors; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
